@@ -1,15 +1,6 @@
 # Personalized Preference Fine-tuning of Diffusion Models
 
-This is the public implemenation of [Personalized Preference Fine-tuning of Diffusion Models](https://arxiv.org/abs/2501.06655) (PPD). PPD is a comprehensive framework for personalized text-to-image generation. This project adapts from the [LLaVA-NeXT repository](https://github.com/LLaVA-VL/LLaVA-NeXT).
-
-## 🚀 Overview
-
-This project implements a personalized text-to-image generation system that learns individual user preferences through:
-
-- **User Classification**: Training neural networks to identify users based on their image preference patterns
-- **Multimodal Embeddings**: Leveraging LLaVA models to extract rich visual-textual representations
-- **Preference Learning**: Understanding user aesthetics through preference pairs and feedback
-- **Personalized Generation**: Adapting image generation to match individual user preferences
+This is the public implementation of [Personalized Preference Fine-tuning of Diffusion Models](https://arxiv.org/abs/2501.06655) (PPD). PPD is a comprehensive framework for personalized text-to-image generation. This project adapts from the [LLaVA-NeXT repository](https://github.com/LLaVA-VL/LLaVA-NeXT).
 
 ## 📁 Project Structure
 
@@ -21,7 +12,7 @@ personalized-t2i/
 │   ├── pick_a_pick_user_emb.py    # Generate user embeddings from preference pairs
 │   └── pick_a_pick_user_cond.py   # Conditional user embedding generation
 ├── eval/                      # Evaluation frameworks
-│   ├── eval_winrate_gpt4o.py    # CGPT 4o-based win rate evaluation
+│   ├── eval_winrate_gpt4o.py    # GPT-4o-based win rate evaluation
 │   ├── eval_winrate_gpt4o_userdesc.py  # User description evaluation
 │   └── eval_winrate.py        # Standard win rate evaluation
 ├── scripts/                   # Shell scripts for automation
@@ -73,12 +64,6 @@ personalized-t2i/
 
 The user classifier learns to identify users based on their image preference patterns using deep neural networks.
 
-**Features:**
-- Multi-layer perceptron with residual connections
-- Layer normalization and dropout for regularization
-- Support for top-k accuracy metrics
-- WandB integration for experiment tracking
-
 **Usage:**
 ```bash
 ./scripts/run_user_classify.sh
@@ -86,13 +71,7 @@ The user classifier learns to identify users based on their image preference pat
 
 ### 2. LLaVA Embeddings (`llava_embeddings/`)
 
-Generates rich multimodal embeddings using state-of-the-art LLaVA models to understand user preferences.
-
-**Key Features:**
-- Integration with LLaVA-OneVision models
-- Few-shot preference learning
-- Multi-image processing capabilities
-- User profile generation from preference pairs
+Generates rich multimodal embeddings using LLaVA-Next models to understand user preferences.
 
 **Usage:**
 ```bash
@@ -101,12 +80,7 @@ Generates rich multimodal embeddings using state-of-the-art LLaVA models to unde
 
 ### 3. Evaluation Framework (`eval/`)
 
-Comprehensive evaluation suite for measuring personalization performance.
-
-**Evaluation Methods:**
-- **Win Rate Evaluation**: Direct preference comparison
-- **ChatGPT-based Evaluation**: LLM-assisted preference assessment
-- **User Description Evaluation**: Text-based user profile evaluation
+Evaluation suite for measuring personalization performance.
 
 **Usage:**
 ```bash
@@ -114,10 +88,10 @@ Comprehensive evaluation suite for measuring personalization performance.
 ./scripts/eval_winrate.sh
 
 # GPT 4o based evaluation
-./scripts/eval_winrate_chatgpt.sh
+./scripts/eval_winrate_gpt4o.sh
 
 # User description evaluation
-./scripts/eval_winrate_chatgpt_userdesc.sh
+./scripts/eval_winrate_gpt4o_userdesc.sh
 ```
 
 ## 📊 Datasets
@@ -149,7 +123,7 @@ python llava_embeddings/pick_a_pick_user_emb.py \
 ### Running Evaluations
 
 ```bash
-python eval/eval_winrate_chatgpt.py \
+python eval/eval_winrate_gpt4o.py \
     --dataset_name "your_test_dataset" \
     --model_name "gpt-4o-mini" \
     --include_cot
