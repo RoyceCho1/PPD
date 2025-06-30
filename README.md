@@ -1,7 +1,8 @@
 # Personalized Preference Fine-tuning of Diffusion Models
 
-This is the public implementation of [Personalized Preference Fine-tuning of Diffusion Models](https://arxiv.org/abs/2501.06655) (PPD). PPD is a comprehensive framework for personalized text-to-image generation. This project adapts from the [LLaVA-NeXT repository](https://github.com/LLaVA-VL/LLaVA-NeXT).
+This is the public implementation of [Personalized Preference Fine-tuning of Diffusion Models](https://arxiv.org/abs/2501.06655) (PPD), accepted to CVPR 2025. PPD is a comprehensive framework for personalized text-to-image generation. This project adapts from the [LLaVA-NeXT repository](https://github.com/LLaVA-VL/LLaVA-NeXT).
 
+**Note**: This codebase includes only the VLM component (Stage 1 in Figure 1 of the paper). The diffusion fine-tuning component (Stage 2) was developed during an industry internship and is not open-sourced.
 ## 📁 Project Structure
 
 ```
@@ -145,14 +146,13 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 If you use this work in your research, please cite:
 
 ```bibtex
-@misc{dang2025personalizedpreferencefinetuningdiffusion,
-      title={Personalized Preference Fine-tuning of Diffusion Models}, 
-      author={Meihua Dang and Anikait Singh and Linqi Zhou and Stefano Ermon and Jiaming Song},
-      year={2025},
-      eprint={2501.06655},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2501.06655}, 
+@InProceedings{dang2025personalized,
+    author    = {Dang, Meihua and Singh, Anikait and Zhou, Linqi and Ermon, Stefano and Song, Jiaming},
+    title     = {Personalized Preference Fine-tuning of Diffusion Models},
+    booktitle = {Proceedings of the Computer Vision and Pattern Recognition Conference (CVPR)},
+    month     = {June},
+    year      = {2025},
+    pages     = {8020-8030}
 }
 ```
 
