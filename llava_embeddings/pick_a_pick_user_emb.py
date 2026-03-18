@@ -128,6 +128,8 @@ def main(_):
         tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, quantization_config=quantization_config, **llava_model_args)
         split_output_path = os.path.join(output_dir, f"{split}_shard{FLAGS.which_chunk}.json")
         
+        # tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, **llava_model_args)
+        
         model.eval()
         split_data = defaultdict(list)
         total_examples = 0
