@@ -16,7 +16,7 @@ flags.DEFINE_integer('epochs', 10, 'Number of epochs for training')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate for training')
 flags.DEFINE_float('weight_decay', 1e-4, 'Weight decay for training')
 flags.DEFINE_integer('input_size', 3584, 'Input size of the model') 
-flags.DEFINE_integer('hidden_size', 512, 'Hidden size of the model')
+flags.DEFINE_integer('hidden_size', 512, 'Hidden size of the model(hidden layer size)')
 flags.DEFINE_integer('num_layers', 4, 'Number of layers in the model')
 flags.DEFINE_integer('num_classes', 304, 'Number of unique users')
 flags.DEFINE_string('dataset_name', 'TODO: add dataset name', 'Name of the model')
@@ -29,39 +29,39 @@ flags.DEFINE_string('output_dir', 'TODO: add output directory', 'Output director
 def get_accuracy(probs, class_, k=1):
     if k == 1:
         # Top-1 accuracy (standard classification accuracy)
-        pred = torch.argmax(probs, dim=-1)
-        correct = torch.sum(pred == class_)
-        return correct.item() / class_.size(0)
+        pred = torch.argmax(probs, dim=-1) # 제일 값이 높은 index 반환
+        correct = torch.sum(pred == class_) # 정답과 일치하는 개수
+        return correct.item() / class_.size(0) # 정확도
     else:
         # Top-k accuracy
-        top_k = torch.topk(probs, k, dim=-1).indices
-        correct = torch.sum(top_k.eq(class_.unsqueeze(-1)))
-        return correct.item() / class_.size(0)
+        top_k = torch.topk(probs, k, dim=-1).indices # 제일 값이 높은 k개의 index 반환 [batch_size, k]
+        correct = torch.sum(top_k.eq(class_.unsqueeze(-1))) # 정답과 일치하는 개수(top-k에 해당 index가 있는지 확인)
+        return correct.item() / class_.size(0) # 정확도
 
 class UserClassifier(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes, num_layers, drop_p=0.1):
         super(UserClassifier, self).__init__()
         
         # Define the model
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.input_size = input_size # input embedding size
+        self.hidden_size = hidden_size # hidden layer size
+        self.num_layers = num_layers # number of mlp layers
         
-        self.input_layer = nn.Linear(input_size, hidden_size)
-        self.activation_layer = nn.GELU()
+        self.input_layer = nn.Linear(input_size, hidden_size) # input_size 데이터를 받아서 hidden_size로 변환
+        self.activation_layer = nn.GELU() # 비선형 함수
         
-        self.mlp_layers = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
-        self.mlp_activation_layers = nn.ModuleList([nn.GELU() for _ in range(num_layers)])
-        self.norm_layers = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(num_layers)])
-        self.dropout_layers = nn.ModuleList([nn.Dropout(drop_p) for _ in range(num_layers)])
+        self.mlp_layers = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)]) # hidden_size 데이터를 받아서 hidden_size로 변환, default 4 layers
+        self.mlp_activation_layers = nn.ModuleList([nn.GELU() for _ in range(num_layers)]) # 비선형 함수, default 4 layers
+        self.norm_layers = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(num_layers)]) # layer normalization, default 4 layers
+        self.dropout_layers = nn.ModuleList([nn.Dropout(drop_p) for _ in range(num_layers)]) # dropout, default 4 layers
         
-        self.output_layer = nn.Linear(hidden_size, num_classes)
+        self.output_layer = nn.Linear(hidden_size, num_classes) # hidden_size 데이터를 받아서 num_classes로 변환
     
     def forward(self, x):
         x = self.input_layer(x)
         x = self.activation_layer(x)
         
-        for i in range(self.num_layers):
+        for i in range(self.num_layers): # default 4 layers
             x = x + self.mlp_layers[i](x)
             x = self.mlp_activation_layers[i](x)
             x = self.norm_layers[i](x)
@@ -75,15 +75,16 @@ def main(_):
     random_str = np.random.bytes(4).hex()
     unique_run_name = f'{FLAGS.dataset_name}-{FLAGS.batch_size}-{FLAGS.epochs}-{FLAGS.learning_rate}-{FLAGS.weight_decay}-{FLAGS.input_size}-{FLAGS.hidden_size}-{FLAGS.num_layers}'
     unique_run_name = unique_run_name.replace('/', '-').replace(' ', '_').replace('.', '_')
-    unique_run_name = f'{unique_run_name}-{random_str}'
+    unique_run_name = f'{unique_run_name}-{random_str}' # unique run name
     
     ds = datasets.load_dataset(FLAGS.dataset_name)
     remove_cols = list(ds['train'].column_names)
     remove_cols.remove('class')
     remove_cols.remove('emb')
+    # class하고 emb를 제외한 나머지 column들을 remove_cols에 추가
     def map_fn(examples):
         for i in range(len(examples['emb'])):
-            examples['emb'][i] = examples['emb'][i][-1]
+            examples['emb'][i] = examples['emb'][i][-1] # last hidden state
         return examples
     ds = ds.map(map_fn, batched=True, num_proc=os.cpu_count(), remove_columns=remove_cols)
     
@@ -91,12 +92,12 @@ def main(_):
         ds['train'], 
         batch_size=FLAGS.batch_size, 
         shuffle=True,
-    )
+    ) # batch size로 묶어서 데이터 로드, 데이터는 무작위로 섞어서 로드
     test_dataloader = torch.utils.data.DataLoader(
         ds['test'],
         batch_size=FLAGS.batch_size, 
         shuffle=True,
-    )
+    ) # batch size로 묶어서 데이터 로드, 데이터는 무작위로 섞어서 로드
     
     model = UserClassifier(
         input_size=FLAGS.input_size,
@@ -106,19 +107,21 @@ def main(_):
     )
     model = model.cuda()
     
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate, weight_decay=FLAGS.weight_decay)
-    num_steps = len(train_dataloader) * FLAGS.epochs
-    warmup_steps = int(FLAGS.warmup_ratio * len(train_dataloader))
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, num_steps)
+    criterion = nn.CrossEntropyLoss() # loss function: Cross Entropy Loss
+    optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate, weight_decay=FLAGS.weight_decay) # optimizer: Adam
+    num_steps = len(train_dataloader) * FLAGS.epochs # number of steps
+    warmup_steps = int(FLAGS.warmup_ratio * len(train_dataloader)) # number of warmup steps
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, num_steps) # learning rate scheduler: cosine schedule with warmup
     
     config_dict = FLAGS.flag_values_dict()
     wandb.init(project=FLAGS.wandb_project, config=config_dict)
     
     def process_batch(data):
-        emb = torch.stack(data['emb']).T.to(device='cuda', dtype=torch.float)
+        emb = torch.stack(data['emb']).T.to(device='cuda', dtype=torch.float) 
         class_ = data['class'].to(device='cuda', dtype=torch.long)
         return emb, class_
+    # emb shape: [batch_size, input_size], class_ shape: [batch_size]
+    # Tensor로 만들고, cuda로 이동
     
     curr_step = 0
     for epoch in range(FLAGS.epochs):
@@ -127,13 +130,13 @@ def main(_):
             emb, class_ = process_batch(data)
             
             optimizer.zero_grad()
-            logits = model(emb)
-            probs = F.softmax(logits, dim=-1)
+            logits = model(emb) # forward pass
+            probs = F.softmax(logits, dim=-1) # softmax
             
-            loss = criterion(logits, class_)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+            loss = criterion(logits, class_) # loss calculation
+            loss.backward() # backward pass
+            optimizer.step() # update weights
+            scheduler.step() # update learning rate
             
             train_stats = dict()
             
