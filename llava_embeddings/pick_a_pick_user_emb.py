@@ -21,10 +21,11 @@ import time
 from collections import defaultdict
 import tqdm
 import pandas as pd
+from transformers import BitsAndBytesConfig
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer('num_shots', 4, 'Number of shots to use for each user')
-flags.DEFINE_string('output_dir', '/home/anikait.singh/personalized-t2i/data', 'Output directory to save the embeddings')
+flags.DEFINE_string('output_dir', '/home/roycecho/Personalized-Text-To-Image-Diffusion/emb_data', 'Output directory to save the embeddings')
 flags.DEFINE_string('pretrained', 'lmms-lab/llava-onevision-qwen2-7b-ov-chat', 'Pretrained model to use')
 flags.DEFINE_string('model_name', "llava_qwen", 'Model name to use')
 flags.DEFINE_string('device', 'cuda', 'Device to use for inference')
@@ -34,7 +35,7 @@ flags.DEFINE_integer('which_chunk', 0, 'Which chunk to process')
 flags.DEFINE_float('temperature', 0.7, 'Temperature to use for inference')
 flags.DEFINE_integer('max_new_tokens', 1024, 'Max new tokens to generate')
 flags.DEFINE_integer('save_every', 100, 'Save every n examples')
-flags.DEFINE_integer('per_user', -1, 'Number of examples per user to generate')
+flags.DEFINE_integer('per_user', -1, 'Number of examples(number of chuncks) per user to generate') # 한 유저에서 나올 embedding
 
 def get_image_from_bytes(byte_string):
     if isinstance(byte_string, list):
@@ -78,13 +79,18 @@ def get_all_shots(user_ds, num_shots, per_user):
             image_dispreferred_uid = row['image_1_uid'] if image_1_uid == preferred_image_ud else image_1_uid
             
             shot_images.append((caption, image_preferred, image_dispreferred, image_preferred_uid, image_dispreferred_uid))
+            # shot_images = [(caption, image_preferred, image_dispreferred, image_preferred_uid, image_dispreferred_uid)] * num_shots
         all_shots.append(shot_images)
     return all_shots
     
 def process_hidden_states(hidden_states):
-    last_hidden_states = hidden_states[-1]
-    tens = torch.cat(last_hidden_states, dim=1).squeeze()
+    last_hidden_states = hidden_states[-1] # last hidden state is usually the most informative
+    tens = torch.cat(last_hidden_states, dim=1).squeeze() # 하나의 시퀀스로 합침
     lst = tens.detach().cpu().numpy().tolist()
+    # detach() : gradient 계산에서 제외
+    # cpu() : gpu 메모리에서 cpu 메모리로 이동
+    # numpy() : numpy 배열로 변환
+    # tolist() : 리스트로 변환
     return lst
 
 def main(_):    
@@ -92,13 +98,13 @@ def main(_):
     output_dir = FLAGS.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    ds = datasets.load_dataset('yuvalkirstain/pickapic_v2')
+    ds = datasets.load_dataset('liuhuohuo2/pick-a-pic-v2')
     for split in splits:
-        all_unique_users = ds[split].unique('user_id')
-        sorted_unique_users = sorted(list(all_unique_users))
-        shard_size = len(sorted_unique_users) // FLAGS.num_chunks
-        start_idx = FLAGS.which_chunk * shard_size
-        end_idx = start_idx + shard_size
+        all_unique_users = ds[split].unique('user_id') # 중복 제거된 사용자 ID
+        sorted_unique_users = sorted(list(all_unique_users)) # 정렬(오름차순)
+        shard_size = len(sorted_unique_users) // FLAGS.num_chunks 
+        start_idx = FLAGS.which_chunk * shard_size # default 0
+        end_idx = start_idx + shard_size # default shard_size
         unique_users = sorted_unique_users[start_idx:end_idx]
         
         per_user = FLAGS.per_user
@@ -107,11 +113,19 @@ def main(_):
         model_name = FLAGS.model_name
         device = FLAGS.device
         device_map = FLAGS.device_map
-        llava_model_args = {"multimodal": True,}
+        llava_model_args = {"multimodal": True,} # language & vision model
         overwrite_config = {}
-        overwrite_config["image_aspect_ratio"] = "pad"
+        overwrite_config["image_aspect_ratio"] = "pad" # image padding(사이즈를 맞추기 위해)
         llava_model_args["overwrite_config"] = overwrite_config
-        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, **llava_model_args)
+        
+        # 4-bit 양자화 설정(VRAM 용량) (load_4bit=True는 transformers 4.45+에서 충돌)
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, quantization_config=quantization_config, **llava_model_args)
         split_output_path = os.path.join(output_dir, f"{split}_shard{FLAGS.which_chunk}.json")
         
         model.eval()
@@ -122,13 +136,13 @@ def main(_):
             def filter_fn(examples):
                 return_list = []
                 for i in range(len(examples['user_id'])):
-                    curr_user = examples['user_id'][i]
-                    is_different = examples['are_different'][i]
-                    has_label = examples['has_label'][i]
+                    curr_user = examples['user_id'][i] 
+                    is_different = examples['are_different'][i] # is the image different?
+                    has_label = examples['has_label'][i] # is there a label?
                     return_list.append(curr_user == user and is_different and has_label)
                 return return_list
             
-            user_ds = ds[split].filter(filter_fn, batched=True, num_proc=os.cpu_count())
+            user_ds = ds[split].filter(filter_fn, batched=True, num_proc=os.cpu_count()) # filter the dataset(using filter.fn)
             if len(user_ds) < num_shots:
                 continue
             
@@ -142,8 +156,8 @@ def main(_):
                 for caption, image_preferred, image_dispreferred, _, _ in shots:
                     images.append(image_preferred)
                     images.append(image_dispreferred)
-                image_tensors = process_images(images, image_processor, model.config)
-                image_tensors = [_image.to(dtype=torch.float16, device=device) for _image in image_tensors]
+                image_tensors = process_images(images, image_processor, model.config) # process_images: image -> tensor
+                image_tensors = [_image.to(dtype=torch.float16, device=device) for _image in image_tensors] # tensor -> float16, device
                 
                 question = "You will be shown a few examples of preferred and dispreferred images."
                 for i in range(num_shots):
@@ -260,18 +274,18 @@ def main(_):
                 else:
                     raise ValueError("Invalid number of shots")
                 
-                question = dedent(question).strip()
+                question = dedent(question).strip() # remove leading/trailing whitespace
                 
                 # Prepare interleaved text-image input
                 conv_template = "qwen_1_5"
                 
                 conv = copy.deepcopy(conv_templates[conv_template])
-                conv.append_message(conv.roles[0], question)
-                conv.append_message(conv.roles[1], None)
+                conv.append_message(conv.roles[0], question) # question
+                conv.append_message(conv.roles[1], None) # answer
                 prompt_question = conv.get_prompt()
                 
-                input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
-                image_sizes = [image.size for image in images]
+                input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device) # tokenizer_image_token: text + image -> input_ids
+                image_sizes = [image.size for image in images] # image.size: (width, height)(혹시 필요로 할때 확인하기 위해 저장)
                 
                 print('Starting inference...')
                 curr_time = time.time()
@@ -280,20 +294,20 @@ def main(_):
                     input_ids,
                     images=image_tensors,
                     image_sizes=image_sizes,
-                    do_sample=False,
-                    temperature=FLAGS.temperature,
+                    do_sample=False, # 램던성 끄기 -> 더 일관적인 결과
+                    temperature=FLAGS.temperature, # 낮을수록 일관적
                     max_new_tokens=FLAGS.max_new_tokens,
-                    return_dict_in_generate=True,
-                    output_hidden_states=True,
+                    return_dict_in_generate=True, # 결과값을 단순한 문자열이 아니라, 자세한 정보가 담긴 딕셔너리로 반환
+                    output_hidden_states=True, # hidden states 반환 -> 임베딩 추출에 사용
                 )
                 print('Inference time:', time.time() - curr_time)
 
-                text_output = tokenizer.batch_decode(gen_dict['sequences'], skip_special_tokens=True)[0]
-                emb = process_hidden_states(gen_dict['hidden_states'])
+                text_output = tokenizer.batch_decode(gen_dict['sequences'], skip_special_tokens=True)[0] #decode answer to text format
+                emb = process_hidden_states(gen_dict['hidden_states']) # extract hidden states
                 
-                split_data['user_id'].append(user)
-                split_data['text'].append(text_output)
-                split_data['emb'].append(emb)
+                split_data['user_id'].append(user) # user id 저장
+                split_data['text'].append(text_output) # text 저장(output text)
+                split_data['emb'].append(emb) # embedding 저장
                 for i in range(len(shots)):
                     caption, _, _, image_preferred_uid, image_dispreferred_uid = shots[i]
                     
@@ -309,8 +323,8 @@ def main(_):
             df = pd.DataFrame(split_data)
             df.to_json(split_output_path)
         # Save for every split
-        df = pd.DataFrame(split_data)
-        df.to_json(split_output_path)
+        df = pd.DataFrame(split_data) # pandas DataFrame으로 변환
+        df.to_json(split_output_path) # json 파일로 저장
 
 
 if __name__ == '__main__':
