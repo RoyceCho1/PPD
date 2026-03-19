@@ -28,8 +28,8 @@ flags.DEFINE_integer('num_shots', 4, 'Number of shots to use for each user')
 flags.DEFINE_string('output_dir', '/home/roycecho/Personalized-Text-To-Image-Diffusion/emb_data', 'Output directory to save the embeddings')
 flags.DEFINE_string('pretrained', 'lmms-lab/llava-onevision-qwen2-7b-ov-chat', 'Pretrained model to use')
 flags.DEFINE_string('model_name', "llava_qwen", 'Model name to use')
-flags.DEFINE_string('device', 'cuda', 'Device to use for inference')
-flags.DEFINE_string('device_map', 'auto', 'Device map to use for inference')
+flags.DEFINE_string('device', 'cuda:0', 'Device to use for inference')
+flags.DEFINE_string('device_map', 'none', 'Device map to use for inference')
 flags.DEFINE_integer('num_chunks', 8, 'Number of chunks to split the data into')
 flags.DEFINE_integer('which_chunk', 0, 'Which chunk to process')
 flags.DEFINE_float('temperature', 0.7, 'Temperature to use for inference')
@@ -112,24 +112,31 @@ def main(_):
         pretrained = FLAGS.pretrained
         model_name = FLAGS.model_name
         device = FLAGS.device
-        device_map = FLAGS.device_map
+        device_map = None if FLAGS.device_map == 'none' else FLAGS.device_map
         llava_model_args = {"multimodal": True,} # language & vision model
         overwrite_config = {}
         overwrite_config["image_aspect_ratio"] = "pad" # image padding(사이즈를 맞추기 위해)
         llava_model_args["overwrite_config"] = overwrite_config
         
         # 4-bit 양자화 설정(VRAM 용량) (load_4bit=True는 transformers 4.45+에서 충돌)
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, quantization_config=quantization_config, **llava_model_args)
+        # quantization_config = BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_compute_dtype=torch.float16,
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_quant_type="nf4",
+        # )
+        # tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, quantization_config=quantization_config, **llava_model_args)
+        
         split_output_path = os.path.join(output_dir, f"{split}_shard{FLAGS.which_chunk}.json")
         
-        # tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, **llava_model_args)
+        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, **llava_model_args)
         
+        print("hf_device_map:", getattr(model, "hf_device_map", None))
+        try:
+            print("first param device:", next(model.parameters()).device)
+        except Exception as e:
+            print("first param device check failed:", e)
+            
         model.eval()
         split_data = defaultdict(list)
         total_examples = 0
@@ -144,7 +151,7 @@ def main(_):
                     return_list.append(curr_user == user and is_different and has_label)
                 return return_list
             
-            user_ds = ds[split].filter(filter_fn, batched=True, num_proc=os.cpu_count()) # filter the dataset(using filter.fn)
+            user_ds = ds[split].filter(filter_fn, batched=True, num_proc=2) # filter the dataset(using filter.fn)
             if len(user_ds) < num_shots:
                 continue
             
