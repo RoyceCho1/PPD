@@ -161,23 +161,37 @@ def main(_):
             print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
             print("=" * 60)
             
-            # max_memory 설정으로 CPU offload 방지 + VRAM 여유 확보
             num_gpus = torch.cuda.device_count()
-            # GPU 3은 vision_tower와 lm_head(단어 15만개 * batch 크기 * 4bytes = ~1.8GB 순간 할당)
-            # 가 함께 올라가서 OOM 위험이 큽니다. 따라서 GPU 0~2에 파라미터를 꽉 채우고
-            # GPU 3에는 모델을 적게 올리는 방향으로 유도합니다.
-            max_memory = {i: "10GiB" for i in range(num_gpus)}
-            max_memory[num_gpus - 1] = "6GiB" # 마지막 GPU의 파라미터 점유 제한
-            max_memory["cpu"] = "0GiB"  # CPU offload 금지 → meta tensor 방지
             
+            # LLaVA의 load_pretrained_model이 max_memory kwargs를 무시하는 경우가 있어,
+            # 아예 수동으로 모든 레이어의 위치를 지정해 줍니다. 
+            # 4개의 GPU 환경에서 GPU 3의 OOM을 막기 위해 모든 트랜스포머 레이어를 GPU 0~2로 몰아줍니다.
+            if num_gpus == 4:
+                print("[INFO] Creating custom balanced 4-GPU device map to prevent OOM on GPU 3")
+                model_device_map = {
+                    'model.embed_tokens': 0,
+                    'model.image_newline': 3, # vision_tower와 같은 GPU에 배치
+                }
+                for i in range(10): model_device_map[f'model.layers.{i}'] = 0
+                for i in range(10, 19): model_device_map[f'model.layers.{i}'] = 1
+                for i in range(19, 28): model_device_map[f'model.layers.{i}'] = 2
+                
+                model_device_map['model.norm'] = 3
+                model_device_map['model.vision_tower'] = 3
+                model_device_map['model.vision_resampler'] = 3
+                model_device_map['model.mm_projector'] = 3
+                model_device_map['lm_head'] = 3
+            else:
+                model_device_map = "auto"
+
             tokenizer, model, image_processor, max_length = load_pretrained_model(
                 pretrained, None, model_name,
-                device_map="auto",
-                max_memory=max_memory,
+                device_map=model_device_map,
                 attn_implementation=None,
                 **llava_model_args
             )
-            # device_map='auto'에서는 model.to() 호출 금지
+            
+            # device_map 설정 시 model.to() 호출 금지
             # 입력 텐서의 device는 모델의 첫 번째 파라미터 위치로 결정
             if hasattr(model, 'hf_device_map') and model.hf_device_map:
                 print("hf_device_map:", model.hf_device_map)
