@@ -30,6 +30,7 @@ flags.DEFINE_string('pretrained', 'lmms-lab/llava-onevision-qwen2-7b-ov-chat', '
 flags.DEFINE_string('model_name', "llava_qwen", 'Model name to use')
 flags.DEFINE_string('device', 'cuda:0', 'Device to use for inference')
 flags.DEFINE_string('device_map', 'none', 'Device map to use for inference')
+flags.DEFINE_boolean('load_4bit', False, 'Load model in 4-bit quantization (requires bitsandbytes)')
 flags.DEFINE_integer('num_chunks', 8, 'Number of chunks to split the data into')
 flags.DEFINE_integer('which_chunk', 0, 'Which chunk to process')
 flags.DEFINE_float('temperature', 0.7, 'Temperature to use for inference')
@@ -112,36 +113,103 @@ def main(_):
         pretrained = FLAGS.pretrained
         model_name = FLAGS.model_name
         device = FLAGS.device
-        device_map = None if FLAGS.device_map == 'none' else FLAGS.device_map
+        device_map_flag = FLAGS.device_map
         llava_model_args = {"multimodal": True,} # language & vision model
         overwrite_config = {}
         overwrite_config["image_aspect_ratio"] = "pad" # image padding(사이즈를 맞추기 위해)
         llava_model_args["overwrite_config"] = overwrite_config
         
-        # 4-bit 양자화 설정(VRAM 용량) (load_4bit=True는 transformers 4.45+에서 충돌)
-        # quantization_config = BitsAndBytesConfig(
-        #     load_in_4bit=True,
-        #     bnb_4bit_compute_dtype=torch.float16,
-        #     bnb_4bit_use_double_quant=True,
-        #     bnb_4bit_quant_type="nf4",
-        # )
-        # tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, quantization_config=quantization_config, **llava_model_args)
-        
         split_output_path = os.path.join(output_dir, f"{split}_shard{FLAGS.which_chunk}.json")
         
-        tokenizer, model, image_processor, max_length = load_pretrained_model(
-            pretrained, None, model_name,
-            device_map=device_map,
-            attn_implementation=None,
-            **llava_model_args
-        )
+        # =====================================================
+        # 모델 로딩: 3가지 모드
+        # (1) --load_4bit        → 4-bit 양자화, 단일 GPU
+        # (2) --device_map auto   → multi-GPU pipeline parallel
+        # (3) --device_map none   → fp16 단일 GPU (기본)
+        # =====================================================
         
-        print("hf_device_map:", getattr(model, "hf_device_map", None))
-        print("before to(device), first param device:", next(model.parameters()).device)
+        if FLAGS.load_4bit:
+            # --- 접근법 A: 4-bit 양자화 (단일 GPU, ~5GB VRAM) ---
+            print("=" * 60)
+            print("[MODE] 4-bit quantization on single GPU")
+            print("=" * 60)
+            
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            
+            # device index 추출 (e.g. "cuda:0" -> 0)
+            device_index = int(device.split(":")[-1]) if ":" in device else 0
+            
+            tokenizer, model, image_processor, max_length = load_pretrained_model(
+                pretrained, None, model_name,
+                device_map={"": device_index},  # 양자화 모델은 이 방식으로 device 지정
+                attn_implementation=None,
+                quantization_config=quantization_config,
+                **llava_model_args
+            )
+            # 4-bit 모델은 .to()가 불가 → device_map이 placement 처리
+            input_device = device
+            
+        elif device_map_flag == 'auto':
+            # --- 접근법 B: Multi-GPU pipeline parallel ---
+            print("=" * 60)
+            print("[MODE] Multi-GPU pipeline parallel (device_map='auto')")
+            print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
+            print("=" * 60)
+            
+            # max_memory 설정으로 CPU offload 방지
+            num_gpus = torch.cuda.device_count()
+            max_memory = {i: "10GiB" for i in range(num_gpus)}
+            max_memory["cpu"] = "0GiB"  # CPU offload 금지 → meta tensor 방지
+            
+            tokenizer, model, image_processor, max_length = load_pretrained_model(
+                pretrained, None, model_name,
+                device_map="auto",
+                max_memory=max_memory,
+                attn_implementation=None,
+                **llava_model_args
+            )
+            # device_map='auto'에서는 model.to() 호출 금지
+            # 입력 텐서의 device는 모델의 첫 번째 파라미터 위치로 결정
+            if hasattr(model, 'hf_device_map') and model.hf_device_map:
+                print("hf_device_map:", model.hf_device_map)
+                # embedding 레이어가 있는 GPU를 input device로 사용
+                first_module = list(model.hf_device_map.keys())[0]
+                first_gpu = model.hf_device_map[first_module]
+                input_device = f"cuda:{first_gpu}" if isinstance(first_gpu, int) else str(first_gpu)
+            else:
+                input_device = next(model.parameters()).device
+                input_device = str(input_device)
+            
+        else:
+            # --- 접근법 C: 기본 fp16 단일 GPU ---
+            print("=" * 60)
+            print(f"[MODE] fp16 single GPU ({device})")
+            print("=" * 60)
+            
+            tokenizer, model, image_processor, max_length = load_pretrained_model(
+                pretrained, None, model_name,
+                device_map=None,
+                attn_implementation=None,
+                **llava_model_args
+            )
+            
+            print("before to(device), first param device:", next(model.parameters()).device)
+            model = model.to(device)
+            print("after to(device), first param device:", next(model.parameters()).device)
+            input_device = device
         
-        model = model.to(device)
-        
-        print("after to(device), first param device:", next(model.parameters()).device)
+        # 공통 확인
+        print(f"[INFO] input_device = {input_device}")
+        print(f"[INFO] hf_device_map = {getattr(model, 'hf_device_map', None)}")
+        try:
+            print(f"[INFO] first param device = {next(model.parameters()).device}")
+        except Exception as e:
+            print(f"[INFO] first param device check failed: {e}")
         
         model.eval()
         split_data = defaultdict(list)
@@ -172,7 +240,7 @@ def main(_):
                     images.append(image_preferred)
                     images.append(image_dispreferred)
                 image_tensors = process_images(images, image_processor, model.config) # process_images: image -> tensor
-                image_tensors = [_image.to(dtype=torch.float16, device=device) for _image in image_tensors] # tensor -> float16, device
+                image_tensors = [_image.to(dtype=torch.float16, device=input_device) for _image in image_tensors] # tensor -> float16, input_device
                 
                 question = "You will be shown a few examples of preferred and dispreferred images."
                 for i in range(num_shots):
@@ -299,7 +367,7 @@ def main(_):
                 conv.append_message(conv.roles[1], None) # answer
                 prompt_question = conv.get_prompt()
                 
-                input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device) # tokenizer_image_token: text + image -> input_ids
+                input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(input_device) # tokenizer_image_token: text + image -> input_ids
                 image_sizes = [image.size for image in images] # image.size: (width, height)(혹시 필요로 할때 확인하기 위해 저장)
                 
                 print('Starting inference...')
