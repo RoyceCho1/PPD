@@ -163,30 +163,19 @@ def main(_):
             
             num_gpus = torch.cuda.device_count()
             
-            # LLaVA의 load_pretrained_model이 max_memory kwargs를 무시하는 경우가 있어,
-            # 아예 수동으로 모든 레이어의 위치를 지정해 줍니다. 
-            # 4개의 GPU 환경에서 GPU 3의 OOM을 막기 위해 모든 트랜스포머 레이어를 GPU 0~2로 몰아줍니다.
-            if num_gpus == 4:
-                print("[INFO] Creating custom balanced 4-GPU device map to prevent OOM on GPU 3")
-                model_device_map = {
-                    'model.embed_tokens': 0,
-                    'model.image_newline': 3, # vision_tower와 같은 GPU에 배치
-                }
-                for i in range(10): model_device_map[f'model.layers.{i}'] = 0
-                for i in range(10, 19): model_device_map[f'model.layers.{i}'] = 1
-                for i in range(19, 28): model_device_map[f'model.layers.{i}'] = 2
-                
-                model_device_map['model.norm'] = 3
-                model_device_map['model.vision_tower'] = 3
-                model_device_map['model.vision_resampler'] = 3
-                model_device_map['model.mm_projector'] = 3
-                model_device_map['lm_head'] = 3
-            else:
-                model_device_map = "auto"
-
+            # [HOTFIX] LLaVA의 load_pretrained_model은 device_map이 dictionary 형태면
+            # 내부적으로 강제로 model.to("cuda:0") 등을 호출해버려서 accelerate hook가 망가집니다.
+            # 그래서 반드시 "auto" 문자열을 넘겨야 하며, GPU 3번의 OOM을 막기 위해 
+            # GPU 3번의 가용 용량을 2500MiB(vision_tower와 lm_head만 겨우 들어갈 크기)로 가장해
+            # 강제로 모든 레이어를 물리적으로 GPU 0~2로 밀어냅니다.
+            max_memory = {i: "10GiB" for i in range(num_gpus)}
+            max_memory[num_gpus - 1] = "2500MiB" 
+            max_memory["cpu"] = "0GiB"
+            
             tokenizer, model, image_processor, max_length = load_pretrained_model(
                 pretrained, None, model_name,
-                device_map=model_device_map,
+                device_map="auto",
+                max_memory=max_memory,
                 attn_implementation=None,
                 **llava_model_args
             )
