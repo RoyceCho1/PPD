@@ -99,6 +99,158 @@ def main(_):
     output_dir = FLAGS.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    per_user = FLAGS.per_user
+    num_shots = FLAGS.num_shots
+    pretrained = FLAGS.pretrained
+    model_name = FLAGS.model_name
+    device = FLAGS.device
+    device_map_flag = FLAGS.device_map
+    llava_model_args = {"multimodal": True,} # language & vision model
+    overwrite_config = {}
+    overwrite_config["image_aspect_ratio"] = "pad" # image padding(사이즈를 맞추기 위해)
+    llava_model_args["overwrite_config"] = overwrite_config
+    
+    # =====================================================
+    # 모델 로딩: 3가지 모드
+    # (1) --load_4bit        → 4-bit 양자화, 단일 GPU
+    # (2) --device_map auto   → multi-GPU pipeline parallel
+    # (3) --device_map none   → fp16 단일 GPU (기본)
+    # =====================================================
+    
+    if FLAGS.load_4bit:
+        # --- 접근법 A: 4-bit 양자화 (단일 GPU, ~5GB VRAM) ---
+        print("=" * 60)
+        print("[MODE] 4-bit quantization on single GPU")
+        print("=" * 60)
+        
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        
+        # device index 추출 (e.g. "cuda:0" -> 0)
+        device_index = int(device.split(":")[-1]) if ":" in device else 0
+        
+        tokenizer, model, image_processor, max_length = load_pretrained_model(
+            pretrained, None, model_name,
+            device_map={"": device_index},  # 양자화 모델은 이 방식으로 device 지정
+            attn_implementation=None,
+            quantization_config=quantization_config,
+            **llava_model_args
+        )
+        # 4-bit 모델은 .to()가 불가 → device_map이 placement 처리
+        input_device = device
+        
+    elif device_map_flag == 'auto':
+        # --- 접근법 B: Multi-GPU pipeline parallel ---
+        print("=" * 60)
+        print("[MODE] Multi-GPU pipeline parallel (device_map='auto')")
+        print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
+        print("=" * 60)
+        
+        num_gpus = torch.cuda.device_count()
+        
+        num_gpus = torch.cuda.device_count()
+        
+        # [HOTFIX] LLaVA의 load_pretrained_model은 device_map이 dictionary 형태면 내부 버그가 발생합니다.
+        # 하지만 "auto"로 두면 OOM이 일어나므로, python 동적 패칭(Monkey Patching)으로 
+        # transformers 라이브러리의 device_map 자동 생성 함수를 가로채어 완벽한 4-GPU 분산 맵을 강제로 주입합니다.
+        import transformers
+        original_infer = transformers.modeling_utils.infer_auto_device_map
+        
+        if device_map_flag == 'auto' and num_gpus == 4:
+            def custom_infer_auto_device_map(*args, **kwargs):
+                d_map = original_infer(*args, **kwargs)
+                print("[HOTFIX] Intercepted Accelerate infer_auto_device_map. Enforcing safe 4-GPU layout!")
+                
+                d_map['model.embed_tokens'] = 0
+                d_map['model.image_newline'] = 0  # 0번 GPU에 둬야 버그 안 남
+                
+                for i in range(10): d_map[f'model.layers.{i}'] = 0
+                for i in range(10, 19): d_map[f'model.layers.{i}'] = 1
+                for i in range(19, 28): d_map[f'model.layers.{i}'] = 2
+                
+                d_map['model.norm'] = 3
+                d_map['model.vision_tower'] = 3
+                d_map['model.vision_resampler'] = 3
+                d_map['model.mm_projector'] = 3
+                d_map['lm_head'] = 3
+                
+                # 디스크 및 CPU 오프로드 강제 제거
+                clean_map = {k: v for k, v in d_map.items() if v not in ['cpu', 'disk']}
+                
+                for k in list(clean_map.keys()):
+                    if 'model.vision_tower' in k:
+                        clean_map[k] = 3
+                        
+                return clean_map
+            
+            transformers.modeling_utils.infer_auto_device_map = custom_infer_auto_device_map
+
+        # max_memory 설정은 오히려 디스크 오프로딩을 유발하므로 삭제하고,
+        # 오직 위의 완벽한 custom_infer_auto_device_map 에만 의존합니다.
+        tokenizer, model, image_processor, max_length = load_pretrained_model(
+            pretrained, None, model_name,
+            device_map="auto",
+            attn_implementation=None,
+            **llava_model_args
+        )
+        
+        # 패치 원상복구
+        if device_map_flag == 'auto' and num_gpus == 4:
+            transformers.modeling_utils.infer_auto_device_map = original_infer
+        
+        # device_map 설정 시 model.to() 호출 금지
+        # 입력 텐서의 device는 모델의 첫 번째 파라미터 위치로 결정
+        if hasattr(model, 'hf_device_map') and model.hf_device_map:
+            print("hf_device_map:", model.hf_device_map)
+            # embedding 레이어가 있는 GPU를 input device로 사용
+            first_module = list(model.hf_device_map.keys())[0]
+            first_gpu = model.hf_device_map[first_module]
+            input_device = f"cuda:{first_gpu}" if isinstance(first_gpu, int) else str(first_gpu)
+        else:
+            input_device = next(model.parameters()).device
+            input_device = str(input_device)
+        
+        # [HOTFIX] model.image_newline has to be on the same device as vision_tower output
+        try:
+            vision_device = next(model.model.vision_tower.parameters()).device
+            if hasattr(model.model, 'image_newline'):
+                model.model.image_newline.data = model.model.image_newline.data.to(vision_device)
+                print(f"[HOTFIX] Moved model.model.image_newline to {vision_device} to match vision_tower")
+        except Exception as e:
+            print(f"[HOTFIX] Could not move image_newline: {e}")
+        
+    else:
+        # --- 접근법 C: 기본 fp16 단일 GPU ---
+        print("=" * 60)
+        print(f"[MODE] fp16 single GPU ({device})")
+        print("=" * 60)
+        
+        tokenizer, model, image_processor, max_length = load_pretrained_model(
+            pretrained, None, model_name,
+            device_map=None,
+            attn_implementation=None,
+            **llava_model_args
+        )
+        
+        print("before to(device), first param device:", next(model.parameters()).device)
+        model = model.to(device)
+        print("after to(device), first param device:", next(model.parameters()).device)
+        input_device = device
+    
+    # 공통 확인
+    print(f"[INFO] input_device = {input_device}")
+    print(f"[INFO] hf_device_map = {getattr(model, 'hf_device_map', None)}")
+    try:
+        print(f"[INFO] first param device = {next(model.parameters()).device}")
+    except Exception as e:
+        print(f"[INFO] first param device check failed: {e}")
+    
+    model.eval()
+
     ds = datasets.load_dataset('liuhuohuo2/pick-a-pic-v2')
     for split in splits:
         all_unique_users = ds[split].unique('user_id') # 중복 제거된 사용자 ID
@@ -108,159 +260,7 @@ def main(_):
         end_idx = start_idx + shard_size # default shard_size
         unique_users = sorted_unique_users[start_idx:end_idx]
         
-        per_user = FLAGS.per_user
-        num_shots = FLAGS.num_shots
-        pretrained = FLAGS.pretrained
-        model_name = FLAGS.model_name
-        device = FLAGS.device
-        device_map_flag = FLAGS.device_map
-        llava_model_args = {"multimodal": True,} # language & vision model
-        overwrite_config = {}
-        overwrite_config["image_aspect_ratio"] = "pad" # image padding(사이즈를 맞추기 위해)
-        llava_model_args["overwrite_config"] = overwrite_config
-        
         split_output_path = os.path.join(output_dir, f"{split}_shard{FLAGS.which_chunk}.json")
-        
-        # =====================================================
-        # 모델 로딩: 3가지 모드
-        # (1) --load_4bit        → 4-bit 양자화, 단일 GPU
-        # (2) --device_map auto   → multi-GPU pipeline parallel
-        # (3) --device_map none   → fp16 단일 GPU (기본)
-        # =====================================================
-        
-        if FLAGS.load_4bit:
-            # --- 접근법 A: 4-bit 양자화 (단일 GPU, ~5GB VRAM) ---
-            print("=" * 60)
-            print("[MODE] 4-bit quantization on single GPU")
-            print("=" * 60)
-            
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            )
-            
-            # device index 추출 (e.g. "cuda:0" -> 0)
-            device_index = int(device.split(":")[-1]) if ":" in device else 0
-            
-            tokenizer, model, image_processor, max_length = load_pretrained_model(
-                pretrained, None, model_name,
-                device_map={"": device_index},  # 양자화 모델은 이 방식으로 device 지정
-                attn_implementation=None,
-                quantization_config=quantization_config,
-                **llava_model_args
-            )
-            # 4-bit 모델은 .to()가 불가 → device_map이 placement 처리
-            input_device = device
-            
-        elif device_map_flag == 'auto':
-            # --- 접근법 B: Multi-GPU pipeline parallel ---
-            print("=" * 60)
-            print("[MODE] Multi-GPU pipeline parallel (device_map='auto')")
-            print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
-            print("=" * 60)
-            
-            num_gpus = torch.cuda.device_count()
-            
-            num_gpus = torch.cuda.device_count()
-            
-            # [HOTFIX] LLaVA의 load_pretrained_model은 device_map이 dictionary 형태면 내부 버그가 발생합니다.
-            # 하지만 "auto"로 두면 OOM이 일어나므로, python 동적 패칭(Monkey Patching)으로 
-            # transformers 라이브러리의 device_map 자동 생성 함수를 가로채어 완벽한 4-GPU 분산 맵을 강제로 주입합니다.
-            import transformers
-            original_infer = transformers.modeling_utils.infer_auto_device_map
-            
-            if device_map_flag == 'auto' and num_gpus == 4:
-                def custom_infer_auto_device_map(*args, **kwargs):
-                    d_map = original_infer(*args, **kwargs)
-                    print("[HOTFIX] Intercepted Accelerate infer_auto_device_map. Enforcing safe 4-GPU layout!")
-                    
-                    d_map['model.embed_tokens'] = 0
-                    d_map['model.image_newline'] = 0  # 0번 GPU에 둬야 버그 안 남
-                    
-                    for i in range(10): d_map[f'model.layers.{i}'] = 0
-                    for i in range(10, 19): d_map[f'model.layers.{i}'] = 1
-                    for i in range(19, 28): d_map[f'model.layers.{i}'] = 2
-                    
-                    d_map['model.norm'] = 3
-                    d_map['model.vision_tower'] = 3
-                    d_map['model.vision_resampler'] = 3
-                    d_map['model.mm_projector'] = 3
-                    d_map['lm_head'] = 3
-                    
-                    # 디스크 및 CPU 오프로드 강제 제거
-                    clean_map = {k: v for k, v in d_map.items() if v not in ['cpu', 'disk']}
-                    
-                    for k in list(clean_map.keys()):
-                        if 'model.vision_tower' in k:
-                            clean_map[k] = 3
-                            
-                    return clean_map
-                
-                transformers.modeling_utils.infer_auto_device_map = custom_infer_auto_device_map
-
-            # max_memory 설정은 오히려 디스크 오프로딩을 유발하므로 삭제하고,
-            # 오직 위의 완벽한 custom_infer_auto_device_map 에만 의존합니다.
-            tokenizer, model, image_processor, max_length = load_pretrained_model(
-                pretrained, None, model_name,
-                device_map="auto",
-                attn_implementation=None,
-                **llava_model_args
-            )
-            
-            # 패치 원상복구
-            if device_map_flag == 'auto' and num_gpus == 4:
-                transformers.modeling_utils.infer_auto_device_map = original_infer
-            
-            # device_map 설정 시 model.to() 호출 금지
-            # 입력 텐서의 device는 모델의 첫 번째 파라미터 위치로 결정
-            if hasattr(model, 'hf_device_map') and model.hf_device_map:
-                print("hf_device_map:", model.hf_device_map)
-                # embedding 레이어가 있는 GPU를 input device로 사용
-                first_module = list(model.hf_device_map.keys())[0]
-                first_gpu = model.hf_device_map[first_module]
-                input_device = f"cuda:{first_gpu}" if isinstance(first_gpu, int) else str(first_gpu)
-            else:
-                input_device = next(model.parameters()).device
-                input_device = str(input_device)
-            
-            # [HOTFIX] model.image_newline has to be on the same device as vision_tower output
-            try:
-                vision_device = next(model.model.vision_tower.parameters()).device
-                if hasattr(model.model, 'image_newline'):
-                    model.model.image_newline.data = model.model.image_newline.data.to(vision_device)
-                    print(f"[HOTFIX] Moved model.model.image_newline to {vision_device} to match vision_tower")
-            except Exception as e:
-                print(f"[HOTFIX] Could not move image_newline: {e}")
-            
-        else:
-            # --- 접근법 C: 기본 fp16 단일 GPU ---
-            print("=" * 60)
-            print(f"[MODE] fp16 single GPU ({device})")
-            print("=" * 60)
-            
-            tokenizer, model, image_processor, max_length = load_pretrained_model(
-                pretrained, None, model_name,
-                device_map=None,
-                attn_implementation=None,
-                **llava_model_args
-            )
-            
-            print("before to(device), first param device:", next(model.parameters()).device)
-            model = model.to(device)
-            print("after to(device), first param device:", next(model.parameters()).device)
-            input_device = device
-        
-        # 공통 확인
-        print(f"[INFO] input_device = {input_device}")
-        print(f"[INFO] hf_device_map = {getattr(model, 'hf_device_map', None)}")
-        try:
-            print(f"[INFO] first param device = {next(model.parameters()).device}")
-        except Exception as e:
-            print(f"[INFO] first param device check failed: {e}")
-        
-        model.eval()
         split_data = defaultdict(list)
         total_examples = 0
         for user in tqdm.tqdm(unique_users, desc=f"Processing users in {split}"):
