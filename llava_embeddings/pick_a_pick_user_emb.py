@@ -131,6 +131,8 @@ def main(_):
         
         tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, **llava_model_args)
         
+        model.to(device)
+        
         print("hf_device_map:", getattr(model, "hf_device_map", None))
         try:
             print("first param device:", next(model.parameters()).device)
