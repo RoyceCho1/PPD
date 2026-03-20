@@ -8,8 +8,8 @@
 num_shards=100
 per_user=20
 # 7B 모델은 인스턴스 하나당 4개의 GPU가 무조건 필요합니다.
-# 8-GPU 서버이므로 "0,1,2,3" 번 GPU 세트와 "4,5,6,7" 번 GPU 세트를 묶어 2개의 작업만 동시에 돌아갈 수 있습니다.
-gpus=("0,1,2,3" "4,5,6,7")
+# 서버에 4장의 GPU만 있으므로 단일 작업(Single Worker)으로 모든 청크를 순차적으로 처리합니다.
+gpus=("0,1,2,3")
 
 exp_num=0
 dry_run=false
@@ -23,7 +23,8 @@ if [ $which_exp -eq -1 ]; then
 fi
 
 for (( which_shard=0; which_shard<num_shards; which_shard++ )); do
-    if [ $which_exp -ne -1 ] && [ $exp_num -ne $which_exp ]; then
+    # 0(짝수 그룹) 또는 1(홀수 그룹)을 넘기면 그것들에 해당하는 청크들만 도맡아 처리함
+    if [ $which_exp -ne -1 ] && [ $((exp_num % 2)) -ne $which_exp ]; then
         exp_num=$((exp_num+1))
         continue
     fi
@@ -36,7 +37,7 @@ for (( which_shard=0; which_shard<num_shards; which_shard++ )); do
     command="python llava_embeddings/pick_a_pick_user_emb_7b.py \
         --device_map auto \
         --pretrained lmms-lab/llava-onevision-qwen2-7b-ov-chat \
-        --num_shots 2 \
+        --num_shots 4 \
         --num_chunks $num_shards \
         --which_chunk $which_shard \
         --per_user $per_user \
