@@ -129,16 +129,20 @@ def main(_):
         
         split_output_path = os.path.join(output_dir, f"{split}_shard{FLAGS.which_chunk}.json")
         
-        tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, device_map=device_map, attn_implementation=None, **llava_model_args)
-        
-        model.to(device)
+        tokenizer, model, image_processor, max_length = load_pretrained_model(
+            pretrained, None, model_name,
+            device_map=device_map,
+            attn_implementation=None,
+            **llava_model_args
+        )
         
         print("hf_device_map:", getattr(model, "hf_device_map", None))
-        try:
-            print("first param device:", next(model.parameters()).device)
-        except Exception as e:
-            print("first param device check failed:", e)
-            
+        print("before to(device), first param device:", next(model.parameters()).device)
+        
+        model = model.to(device)
+        
+        print("after to(device), first param device:", next(model.parameters()).device)
+        
         model.eval()
         split_data = defaultdict(list)
         total_examples = 0
@@ -153,7 +157,7 @@ def main(_):
                     return_list.append(curr_user == user and is_different and has_label)
                 return return_list
             
-            user_ds = ds[split].filter(filter_fn, batched=True, num_proc=2) # filter the dataset(using filter.fn)
+            user_ds = ds[split].filter(filter_fn, batched=True, num_proc=1) # filter the dataset(using filter.fn)
             if len(user_ds) < num_shots:
                 continue
             
