@@ -185,6 +185,15 @@ def main(_):
                 input_device = next(model.parameters()).device
                 input_device = str(input_device)
             
+            # [HOTFIX] model.image_newline has to be on the same device as vision_tower output
+            try:
+                vision_device = next(model.model.vision_tower.parameters()).device
+                if hasattr(model.model, 'image_newline'):
+                    model.model.image_newline.data = model.model.image_newline.data.to(vision_device)
+                    print(f"[HOTFIX] Moved model.model.image_newline to {vision_device} to match vision_tower")
+            except Exception as e:
+                print(f"[HOTFIX] Could not move image_newline: {e}")
+            
         else:
             # --- 접근법 C: 기본 fp16 단일 GPU ---
             print("=" * 60)
