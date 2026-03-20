@@ -7,6 +7,7 @@ from PIL import Image
 import requests
 import copy
 import torch
+import math
 
 import sys
 import warnings
@@ -248,14 +249,15 @@ def main(_):
         print(f"[INFO] first param device = {next(model.parameters()).device}")
     except Exception as e:
         print(f"[INFO] first param device check failed: {e}")
-    
     model.eval()
 
+    
     ds = datasets.load_dataset('liuhuohuo2/pick-a-pic-v2')
     for split in splits:
         all_unique_users = ds[split].unique('user_id') # 중복 제거된 사용자 ID
         sorted_unique_users = sorted(list(all_unique_users)) # 정렬(오름차순)
-        shard_size = len(sorted_unique_users) // FLAGS.num_chunks 
+        # BUG FIX: 나누어 떨어지지 않는 나머지가 버려지거나, 유저 수가 num_chunks보다 작을 때 0이 되는 것을 방지 (올림 처리)
+        shard_size = math.ceil(len(sorted_unique_users) / FLAGS.num_chunks)
         start_idx = FLAGS.which_chunk * shard_size # default 0
         end_idx = start_idx + shard_size # default shard_size
         unique_users = sorted_unique_users[start_idx:end_idx]
