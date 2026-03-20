@@ -163,13 +163,49 @@ def main(_):
             
             num_gpus = torch.cuda.device_count()
             
-            # [HOTFIX] LLaVA의 load_pretrained_model은 device_map이 dictionary 형태면
-            # 내부적으로 강제로 model.to("cuda:0") 등을 호출해버려서 accelerate hook가 망가집니다.
-            # 그래서 반드시 "auto" 문자열을 넘겨야 하며, GPU 3번의 OOM을 막기 위해 
-            # GPU 3번의 가용 용량을 2500MiB(vision_tower와 lm_head만 겨우 들어갈 크기)로 가장해
-            # 강제로 모든 레이어를 물리적으로 GPU 0~2로 밀어냅니다.
+            num_gpus = torch.cuda.device_count()
+            
+            # [HOTFIX] LLaVA의 load_pretrained_model은 device_map이 dictionary 형태면 내부 버그가 발생합니다.
+            # 하지만 "auto"로 두면 메모리 여유 마진 때문에 모델의 절반을 디스크로 offload 해버리는 파멸적인 결과가 나옵니다.
+            # 이 두 가지 버그를 동시에 우회하기 위해, python 동적 패칭(Monkey Patching)으로 
+            # accelerate 라이브러리의 device_map 자동 생성 함수를 가로채어 완벽한 4-GPU 맵을 주입함과 동시에,
+            # LLaVA에는 "auto"라는 문자열만 전달하여 아무 버그도 발동하지 않게 만드는 궁극의 핫픽스입니다.
+            
+            if device_map_flag == 'auto' and num_gpus == 4:
+                import accelerate
+                original_infer = accelerate.infer_auto_device_map
+                
+                def custom_infer_auto_device_map(*args, **kwargs):
+                    d_map = original_infer(*args, **kwargs)
+                    print("[HOTFIX] Intercepted Accelerate infer_auto_device_map. Enforcing safe 4-GPU layout!")
+                    
+                    d_map['model.embed_tokens'] = 0
+                    d_map['model.image_newline'] = 0  # 0번 GPU에 둬야 버그가 안남 (HOTFIX 코드와 연계)
+                    
+                    for i in range(10): d_map[f'model.layers.{i}'] = 0
+                    for i in range(10, 19): d_map[f'model.layers.{i}'] = 1
+                    for i in range(19, 28): d_map[f'model.layers.{i}'] = 2
+                    
+                    d_map['model.norm'] = 3
+                    d_map['model.vision_tower'] = 3
+                    d_map['model.vision_resampler'] = 3
+                    d_map['model.mm_projector'] = 3
+                    d_map['lm_head'] = 3
+                    
+                    # 디스크 및 CPU 오프로드 강제 제거 (전부 GPU VRAM에 꽉 차게 들어감)
+                    clean_map = {k: v for k, v in d_map.items() if v not in ['cpu', 'disk']}
+                    
+                    # SigLIP vision_tower 내부의 디테일한 레이어 키들도 모조리 3번 GPU로 강제 매핑
+                    for k in list(clean_map.keys()):
+                        if 'model.vision_tower' in k:
+                            clean_map[k] = 3
+                            
+                    return clean_map
+                
+                accelerate.infer_auto_device_map = custom_infer_auto_device_map
+
+            # CPU 오프로드를 막기 위해 max_memory는 충분히 제공 ("auto" 패치 덕분에 완벽하게 분배됨)
             max_memory = {i: "10GiB" for i in range(num_gpus)}
-            max_memory[num_gpus - 1] = "2500MiB" 
             max_memory["cpu"] = "0GiB"
             
             tokenizer, model, image_processor, max_length = load_pretrained_model(
@@ -179,6 +215,10 @@ def main(_):
                 attn_implementation=None,
                 **llava_model_args
             )
+            
+            # 패치 원상복구
+            if device_map_flag == 'auto' and num_gpus == 4:
+                accelerate.infer_auto_device_map = original_infer
             
             # device_map 설정 시 model.to() 호출 금지
             # 입력 텐서의 device는 모델의 첫 번째 파라미터 위치로 결정
