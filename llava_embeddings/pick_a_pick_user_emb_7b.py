@@ -161,9 +161,13 @@ def main(_):
             print(f"[INFO] Available GPUs: {torch.cuda.device_count()}")
             print("=" * 60)
             
-            # max_memory 설정으로 CPU offload 방지
+            # max_memory 설정으로 CPU offload 방지 + VRAM 여유 확보
             num_gpus = torch.cuda.device_count()
+            # GPU 3은 vision_tower와 lm_head(단어 15만개 * batch 크기 * 4bytes = ~1.8GB 순간 할당)
+            # 가 함께 올라가서 OOM 위험이 큽니다. 따라서 GPU 0~2에 파라미터를 꽉 채우고
+            # GPU 3에는 모델을 적게 올리는 방향으로 유도합니다.
             max_memory = {i: "10GiB" for i in range(num_gpus)}
+            max_memory[num_gpus - 1] = "6GiB" # 마지막 GPU의 파라미터 점유 제한
             max_memory["cpu"] = "0GiB"  # CPU offload 금지 → meta tensor 방지
             
             tokenizer, model, image_processor, max_length = load_pretrained_model(
@@ -411,6 +415,15 @@ def main(_):
                     df = pd.DataFrame(split_data)
                     df.to_json(split_output_path)
                 total_examples += 1
+                
+                # ------ [HOTFIX] 메모리 반환 ------
+                del gen_dict
+                del input_ids
+                del image_tensors
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                
             # Save for every user
             df = pd.DataFrame(split_data)
             df.to_json(split_output_path)
