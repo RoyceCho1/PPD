@@ -134,6 +134,20 @@ def main(_):
         if device_map_flag == 'none':
             device_index = int(device.split(":")[-1]) if ":" in device else 0
             d_map = {"": device_index}
+        elif device_map_flag == 'auto' and torch.cuda.device_count() == 2:
+            print("[HOTFIX] Applying Custom 2-GPU ASYMMETRIC Map to prevent Logit OOM!")
+            # lm_head가 동작할 때 단번에 3.5GB 이상의 메모리가 스파이크되므로, 
+            # GPU 1번(lm_head 위치)의 레이어 비중을 확 줄여서 메모리를 일부러 텅텅 비워둡니다.
+            d_map = {}
+            d_map['model.vision_tower'] = 0
+            d_map['model.vision_resampler'] = 0
+            d_map['model.mm_projector'] = 0
+            d_map['model.embed_tokens'] = 0
+            d_map['model.image_newline'] = 0
+            for i in range(18): d_map[f'model.layers.{i}'] = 0
+            for i in range(18, 28): d_map[f'model.layers.{i}'] = 1
+            d_map['model.norm'] = 1
+            d_map['lm_head'] = 1
         else:
             d_map = device_map_flag
             
