@@ -144,8 +144,9 @@ def main(_):
             d_map['model.mm_projector'] = 0
             d_map['model.embed_tokens'] = 0
             d_map['model.image_newline'] = 0
-            for i in range(18): d_map[f'model.layers.{i}'] = 0
-            for i in range(18, 28): d_map[f'model.layers.{i}'] = 1
+            # 밸런스 튜닝: GPU 0번에서 막판에 44MB가 모자랐으므로, 레이어 6개를 GPU 1번으로 넘겨 숨통을 틔웁니다.
+            for i in range(12): d_map[f'model.layers.{i}'] = 0
+            for i in range(12, 28): d_map[f'model.layers.{i}'] = 1
             d_map['model.norm'] = 1
             d_map['lm_head'] = 1
         else:
