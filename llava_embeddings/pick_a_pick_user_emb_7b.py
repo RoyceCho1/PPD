@@ -144,9 +144,10 @@ def main(_):
             d_map['model.mm_projector'] = 0
             d_map['model.embed_tokens'] = 0
             d_map['model.image_newline'] = 0
-            # 밸런스 튜닝: GPU 0번에서 막판에 44MB가 모자랐으므로, 레이어 6개를 GPU 1번으로 넘겨 숨통을 틔웁니다.
-            for i in range(12): d_map[f'model.layers.{i}'] = 0
-            for i in range(12, 28): d_map[f'model.layers.{i}'] = 1
+            # 밸런스 튜닝 2차: 18/10 에서는 GPU 0이 44MB 부족, 12/16 에서는 GPU 1이 700MB 부족.
+            # 계산 결과 1레이어당 약 200MB 처리를 요구하므로 '17/11'이 수학적인 완벽한 스윗스팟입니다.
+            for i in range(17): d_map[f'model.layers.{i}'] = 0
+            for i in range(17, 28): d_map[f'model.layers.{i}'] = 1
             d_map['model.norm'] = 1
             d_map['lm_head'] = 1
         else:
