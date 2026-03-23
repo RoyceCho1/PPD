@@ -150,6 +150,19 @@ def main(_):
             for i in range(17, 28): d_map[f'model.layers.{i}'] = 1
             d_map['model.norm'] = 1
             d_map['lm_head'] = 1
+        elif device_map_flag == 'auto' and torch.cuda.device_count() == 4:
+            print("[HOTFIX] Applying Custom 4-GPU 4-BIT Map to completely eliminate OOM!")
+            d_map = {}
+            d_map['model.vision_tower'] = 0
+            d_map['model.vision_resampler'] = 0
+            d_map['model.mm_projector'] = 0
+            d_map['model.embed_tokens'] = 0
+            d_map['model.image_newline'] = 0
+            for i in range(12): d_map[f'model.layers.{i}'] = 1
+            for i in range(12, 24): d_map[f'model.layers.{i}'] = 2
+            for i in range(24, 28): d_map[f'model.layers.{i}'] = 3
+            d_map['model.norm'] = 3
+            d_map['lm_head'] = 3
         else:
             d_map = device_map_flag
             
