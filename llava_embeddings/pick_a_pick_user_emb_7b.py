@@ -156,7 +156,7 @@ def main(_):
         tokenizer, model, image_processor, max_length = load_pretrained_model(
             pretrained, None, model_name,
             device_map=d_map,
-            attn_implementation=None,
+            attn_implementation="sdpa",
             quantization_config=quantization_config,
             **llava_model_args
         )
