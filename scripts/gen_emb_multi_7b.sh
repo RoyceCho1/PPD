@@ -35,7 +35,6 @@ for (( which_shard=0; which_shard<num_shards; which_shard++ )); do
 
     echo "Running chunk $which_shard on GPUs $which_gpu"
     command="python llava_embeddings/pick_a_pick_user_emb_7b.py \
-        --load_4bit \
         --device_map auto \
         --pretrained lmms-lab/llava-onevision-qwen2-7b-ov-chat \
         --num_shots 4 \
