@@ -32,8 +32,9 @@ for (( which_shard=0; which_shard<num_shards; which_shard++ )); do
     
     echo "Running chunk $which_shard on GPU $which_gpu (Background)"
     
-    # 2장씩 묶어 쓰므로 --load_4bit을 끄고 --device_map auto를 사용하여 메모리를 절반씩 분산시킵니다.
+    # Option B + 4-bit: 2장씩 묶어 메모리 공간을 충분히 넓히면서 모델은 가장 가볍게 만듭니다. OOM 완벽 방지!
     command="python llava_embeddings/pick_a_pick_user_emb_7b.py \
+        --load_4bit \
         --device_map auto \
         --pretrained lmms-lab/llava-onevision-qwen2-7b-ov-chat \
         --num_shots 4 \

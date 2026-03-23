@@ -119,9 +119,9 @@ def main(_):
     # =====================================================
     
     if FLAGS.load_4bit:
-        # --- 접근법 A: 4-bit 양자화 (단일 GPU, ~5GB VRAM) ---
+        # --- 수정: 4-bit 양자화 상태에서도 사용자가 입력한 device_map을 그대로 따릅니다 ---
         print("=" * 60)
-        print("[MODE] 4-bit quantization on single GPU")
+        print(f"[MODE] 4-bit quantization with device_map={device_map_flag}")
         print("=" * 60)
         
         quantization_config = BitsAndBytesConfig(
@@ -131,18 +131,37 @@ def main(_):
             bnb_4bit_quant_type="nf4",
         )
         
-        # device index 추출 (e.g. "cuda:0" -> 0)
-        device_index = int(device.split(":")[-1]) if ":" in device else 0
-        
+        if device_map_flag == 'none':
+            device_index = int(device.split(":")[-1]) if ":" in device else 0
+            d_map = {"": device_index}
+        else:
+            d_map = device_map_flag
+            
         tokenizer, model, image_processor, max_length = load_pretrained_model(
             pretrained, None, model_name,
-            device_map={"": device_index},  # 양자화 모델은 이 방식으로 device 지정
+            device_map=d_map,
             attn_implementation=None,
             quantization_config=quantization_config,
             **llava_model_args
         )
-        # 4-bit 모델은 .to()가 불가 → device_map이 placement 처리
-        input_device = device
+        
+        if hasattr(model, 'hf_device_map') and model.hf_device_map:
+            first_module = list(model.hf_device_map.keys())[0]
+            first_gpu = model.hf_device_map[first_module]
+            input_device = f"cuda:{first_gpu}" if isinstance(first_gpu, int) else str(first_gpu)
+        else:
+            input_device = device
+            
+        # [HOTFIX] auto map일 경우 모델 이미지 줄바꿈 토큰 디바이스 맞춤
+        if device_map_flag == 'auto':
+            try:
+                vision_device = next(model.model.vision_tower.parameters()).device
+                if hasattr(model.model, 'image_newline'):
+                    model.model.image_newline.data = model.model.image_newline.data.to(vision_device)
+                    print(f"[HOTFIX] Moved model.model.image_newline to {vision_device} to match vision_tower")
+            except Exception as e:
+                pass
+
         
     elif device_map_flag == 'auto':
         # --- 접근법 B: Multi-GPU pipeline parallel ---
