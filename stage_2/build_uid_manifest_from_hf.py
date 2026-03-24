@@ -158,8 +158,18 @@ def build_manifest(
 
     image_cols = [("image_0_uid", "jpg_0", "image_1_uid"), ("image_1_uid", "jpg_1", "image_0_uid")]
 
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        tqdm = lambda x, **kwargs: x
+
     for split_name, split_ds in _iter_splits(ds_obj):
-        for row_idx, row in _as_row_iterator(split_ds):
+        row_iterator = tqdm(
+            _as_row_iterator(split_ds),
+            desc=f"Scanning {split_name} split",
+            total=len(split_ds) if hasattr(split_ds, "__len__") else None
+        )
+        for row_idx, row in row_iterator:
             rows_scanned += 1
 
             caption = row.get("caption")
