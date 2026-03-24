@@ -24,24 +24,6 @@ class _UserParseResult:
 
 
 class Stage2PreferenceDataset(Dataset):
-    """Dataset for Stage 2 DPO-style personalized diffusion training.
-
-    This dataset treats Stage 1 embedding JSON as the primary source of truth and
-    flattens user-level records into pair-level samples. Each sample includes both
-    preference pair data and the corresponding user embedding.
-
-    Args:
-        embedding_json_path: Path to Stage 1 embedding JSON.
-        uid_to_path_json_path: Optional JSON path mapping image UID -> image file path.
-        uid_to_meta_json_path: Optional JSON path mapping image UID -> extra metadata.
-        load_images: If True, tries to load image objects for preferred/dispreferred
-            samples via image paths.
-        skip_malformed_pairs: If True, malformed pairs are skipped. If False, raises
-            a ValueError on malformed records/pairs.
-        strict_emb_dim: If True, enforces user embedding last dim to be 3584.
-        expected_emb_dim: Expected embedding dimension for strict checking.
-        image_loader: Optional callable(path) -> image object.
-    """
 
     def __init__(
         self,
@@ -49,8 +31,8 @@ class Stage2PreferenceDataset(Dataset):
         uid_to_path_json_path: Optional[Union[str, Path]] = None,
         uid_to_meta_json_path: Optional[Union[str, Path]] = None,
         load_images: bool = False,
-        skip_malformed_pairs: bool = True,
-        strict_emb_dim: bool = True,
+        skip_malformed_pairs: bool = True, # 정보가 누락된 pair의 경우 skip한다
+        strict_emb_dim: bool = True, # user embedding의 마지막 차원이 3584가 아니면 에러를 발생시킨다
         expected_emb_dim: int = 3584,
         image_loader: Optional[Callable[[str], Any]] = None,
     ) -> None:
@@ -63,20 +45,20 @@ class Stage2PreferenceDataset(Dataset):
         self.expected_emb_dim = expected_emb_dim
         self.image_loader = image_loader or self._default_image_loader
 
-        self._uid_to_path: Dict[str, str] = self._load_optional_mapping(self.uid_to_path_json_path)
-        self._uid_to_meta: Dict[str, Any] = self._load_optional_mapping(self.uid_to_meta_json_path)
+        self._uid_to_path: Dict[str, str] = self._load_optional_mapping(self.uid_to_path_json_path) # dictionary 형태로 저장
+        self._uid_to_meta: Dict[str, Any] = self._load_optional_mapping(self.uid_to_meta_json_path) # dictionary 형태로 저장
 
-        raw = self._load_json_file(self.embedding_json_path)
-        self._user_records = self._normalize_records(raw)
+        raw = self._load_json_file(self.embedding_json_path) # json 파일 로드
+        self._user_records = self._normalize_records(raw) 
 
-        self._stats_cache: Optional[Dict[str, Any]] = None
-        self._malformed_pairs_skipped = 0
-        self._malformed_users_skipped = 0
-        self._pair_count_per_user: Counter[int] = Counter()
+        self._stats_cache: Optional[Dict[str, Any]] = None # for get_stats()
+        self._malformed_pairs_skipped = 0 # malformed pair의 개수
+        self._malformed_users_skipped = 0 # malformed user의 개수
+        self._pair_count_per_user: Counter[int] = Counter() # user별 pair의 개수
 
-        self.samples = self.build_samples()
+        self.samples = self.build_samples() # sample 생성
 
-    @staticmethod
+    @staticmethod # self를 건드리지 않고, 독립적으로 작동할 수 있게 하는 데코레이터
     def _load_json_file(path: Path) -> Any:
         if not path.exists():
             raise FileNotFoundError(f"JSON file not found: {path}")
@@ -88,7 +70,7 @@ class Stage2PreferenceDataset(Dataset):
 
     @staticmethod
     def _normalize_key(key: Any) -> str:
-        return str(key)
+        return str(key) # key값 string으로 변환
 
     def _load_optional_mapping(self, path: Optional[Path]) -> Dict[str, Any]:
         if path is None:
@@ -108,14 +90,9 @@ class Stage2PreferenceDataset(Dataset):
 
         return sorted(keys, key=_sort_key)
 
+    # json 파일의 형태를 정제하는 함수
     def _normalize_records(self, raw: Any) -> List[Dict[str, Any]]:
-        """Normalize Stage 1 JSON into a list of user-level records.
-
-        Supports:
-        - List[Dict[str, Any]] (record-oriented)
-        - Dict[str, Dict[index, value]] / Dict[str, List[value]] (column-oriented)
-        - Dict[str, Any] (single-record fallback)
-        """
+        
         if isinstance(raw, list):
             if not all(isinstance(x, Mapping) for x in raw):
                 raise ValueError("Embedding JSON list must contain only objects/dicts")
