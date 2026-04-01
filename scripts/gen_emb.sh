@@ -1,37 +1,48 @@
-num_shards=8
-per_user=20
-which_shards=(0 1 2 3 4 5 6 7)
-gpus=(0 1 2 3 4 5 6 7)
+#!/bin/bash
+set -euo pipefail
 
-exp_num=0
-dry_run=false
-output_dir="data/"
-mkdir -p $output_dir
+# 기존 환경의 8개 GPU 분할 구성을 단일 GPU 환경에 맞게 최적화한 스크립트입니다.
+# `pick_a_pick_user_emb_7b.py` 를 실행하여 User Embedding을 생성합니다.
 
-which_exp=${1:--1}
-if [ $which_exp -eq -1 ]; then
-    echo "Running all experiments"
-fi
+# Conda 환경 초기화 (기본 설정)
+source /data/roycecho/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true
+conda activate ppd
 
-for which_shard in ${which_shards[@]}; do
-    if [ $which_exp -ne -1 ] && [ $exp_num -ne $which_exp ]; then
-        exp_num=$((exp_num+1))
-        continue
-    fi
-    which_gpu=${gpus[$exp_num % ${#gpus[@]}]}
-    export CUDA_VISIBLE_DEVICES=$which_gpu
+# ==========================================
+# 사용자 설정 변수 (단일 GPU)
+# ==========================================
+export CUDA_VISIBLE_DEVICES=1
+export HF_HOME="/data/roycecho/.cache/huggingface"
 
-    echo "Running experiment $exp_num on GPU $which_gpu"
-    command="python llava_embeddings/pick_a_pick_user_emb.py \
-        --num_chunks $num_shards \
-        --which_chunk $which_shard \
-        --per_user $per_user \
-        --output_dir $output_dir \
-    "
-    
-    echo $command
-    if [ $dry_run = false ]; then
-        eval $command
-    fi
-    exp_num=$((exp_num+1))
-done
+# 변수 기본 설정 (실행 시 환경 변수로 덮어쓰기 가능)
+OUTPUT_DIR="${OUTPUT_DIR:-/data/roycecho/PPD/data/user_emb_7b_full}"
+NUM_SHOTS="${NUM_SHOTS:-4}"
+PER_USER="${PER_USER:-20}"        # -1은 제한 없이 모든 데이터를 사용
+DEVICE_MAP="${DEVICE_MAP:-none}" # 1개 GPU 이므로 자동 맵핑 대신 명확하게 none 처리
+NUM_CHUNKS="${NUM_CHUNKS:-1}"    # 전체 데이터를 한번에 처리하도록(1 chunk) 설정
+WHICH_CHUNK="${1:-0}"            # 스크립트 실행 시 첫 번째 인자로 청크 번호 지정 가능 (기본값: 0)
+
+# ==========================================
+# 실행
+# ==========================================
+mkdir -p "${OUTPUT_DIR}"
+
+echo "=========================================================="
+echo "    [STARTING PPD USER EMBEDDING GENERATION (7B)]"
+echo "=========================================================="
+echo "- 모델: LLaVA-1.5 / Qwen2 7B"
+echo "- 출력 디렉토리: ${OUTPUT_DIR}"
+echo "- 청크 설정: 전체 ${NUM_CHUNKS}조각 중 ${WHICH_CHUNK}번째 처리"
+echo "- 사용 GPU: RTX 5090 (cuda:0)"
+echo "=========================================================="
+
+python llava_embeddings/pick_a_pick_user_emb_7b.py \
+    --device cuda:0 \
+    --device_map "${DEVICE_MAP}" \
+    --num_shots "${NUM_SHOTS}" \
+    --num_chunks "${NUM_CHUNKS}" \
+    --which_chunk "${WHICH_CHUNK}" \
+    --per_user "${PER_USER}" \
+    --output_dir "${OUTPUT_DIR}"
+
+echo "User Embedding 생성이 완료되었습니다!"

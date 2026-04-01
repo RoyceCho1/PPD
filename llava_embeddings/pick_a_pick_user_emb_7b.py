@@ -26,7 +26,7 @@ from transformers import BitsAndBytesConfig
 
 FLAGS = flags.FLAGS
 flags.DEFINE_integer('num_shots', 4, 'Number of shots to use for each user')
-flags.DEFINE_string('output_dir', '/home/roycecho/Personalized-Text-To-Image-Diffusion/emb_data', 'Output directory to save the embeddings')
+flags.DEFINE_string('output_dir', '/data/roycecho/PPD/data/user_emb', 'Output directory to save the embeddings')
 flags.DEFINE_string('pretrained', 'lmms-lab/llava-onevision-qwen2-7b-ov-chat', 'Pretrained model to use')
 flags.DEFINE_string('model_name', "llava_qwen", 'Model name to use')
 flags.DEFINE_string('device', 'cuda:0', 'Device to use for inference')
