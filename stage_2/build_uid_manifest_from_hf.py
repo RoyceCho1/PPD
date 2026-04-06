@@ -10,6 +10,9 @@ Design goal:
 - Stage 2 dataset remains Stage1-JSON-centric.
 - HF dataset is used only as an auxiliary source to build lookup manifests.
 """
+import os
+os.environ["HF_HOME"] = "/var/tmp/roycecho_hf"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 import argparse
 import io

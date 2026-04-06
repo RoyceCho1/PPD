@@ -21,8 +21,8 @@ PER_USER="${PER_USER:-20}"
 DEVICE_MAP="${DEVICE_MAP:-none}" 
 
 NUM_CHUNKS=100
-START_CHUNK=33
-END_CHUNK=100
+START_CHUNK=44
+END_CHUNK=80
 
 # ==========================================
 # 실행
@@ -39,7 +39,7 @@ echo "- 사용 환경: RTX 5090 단일 GPU 설정"
 echo "=========================================================="
 
 for (( which_chunk=$START_CHUNK; which_chunk<$END_CHUNK; which_chunk++ )); do
-    echo ">> [INFO] Running chunk ${which_chunk} / 99..."
+    echo ">> [INFO] Running chunk ${which_chunk}"
     python llava_embeddings/pick_a_pick_user_emb_7b.py \
         --device cuda:0 \
         --device_map "${DEVICE_MAP}" \

@@ -22,8 +22,8 @@ if [ $which_exp -eq -1 ]; then
     echo "Running all experiments sequentially"
 fi
 
-# 전체 데이터를 100조각 낸 것 중, 0부터 32번째 조각까지만 실행 (정확히 33% 분량)
-for (( which_shard=0; which_shard<33; which_shard++ )); do
+# 전체 데이터를 100조각 낸 것 중, 67부터 99번째 조각까지만 실행
+for (( which_shard=67; which_shard<100; which_shard++ )); do
     # 0(짝수 그룹) 또는 1(홀수 그룹)을 넘기면 그것들에 해당하는 청크들만 도맡아 처리함
     if [ $which_exp -ne -1 ] && [ $((exp_num % 2)) -ne $which_exp ]; then
         exp_num=$((exp_num+1))
