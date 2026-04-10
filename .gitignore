@@ -5,6 +5,8 @@ downloaded_pickapic_v2/
 *.egg-info/
 wandb/
 checkpoints/
+stage_2/artifacts/
+artifacts/
 *.pdf
 
 # Byte-compiled / optimized / DLL files
