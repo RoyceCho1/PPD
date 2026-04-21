@@ -151,7 +151,7 @@ assignment 생성 작업을 shard 단위로 여러 번 실행하는 배치 runne
 7. `image_to_latents.py`
 8. `build_latent_manifest.py`
 
-앞의 1~4는 "모델 쪽 핵심 흐름", 뒤의 5~8은 "입력 데이터와 latent artifact 준비 흐름"이다.
+앞의 1-4는 "모델 쪽 핵심 흐름", 뒤의 5-8은 "입력 데이터와 latent artifact 준비 흐름"이다.
 
 ## 한 줄로 요약하면
 
