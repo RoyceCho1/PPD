@@ -46,6 +46,7 @@ class ImageRecord:
     """One resolved image input."""
 
     image_path: str
+    uid: Optional[str] = None
 
 
 @dataclass
@@ -65,6 +66,7 @@ class TensorStats:
 class SaveMetadata:
     """Metadata saved next to one latent file."""
 
+    uid: Optional[str]
     original_image_path: str
     latent_path: str
     latent_shape: List[int]
@@ -142,6 +144,134 @@ def _resolve_checkpoint_path(checkpoint_arg: Optional[str]) -> Path:
     )
 
 
+def _load_json_file(path: Path, *, label: str) -> Any:
+    """Load a JSON file with a readable error message."""
+
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label} file does not exist: {resolved}")
+    try:
+        with resolved.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse {label} JSON: {resolved} ({exc})") from exc
+
+
+def _normalize_uid(value: Any) -> str:
+    """Normalize an image UID into a non-empty string."""
+
+    uid = str(value).strip()
+    if not uid:
+        raise ValueError("Resolved UID is empty.")
+    return uid
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> List[str]:
+    """Deduplicate strings while preserving insertion order."""
+
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _load_needed_uids_json(path: Path) -> List[str]:
+    """Load needed UIDs from a JSON file."""
+
+    data = _load_json_file(path, label="needed_uids")
+    raw_uids: Any
+
+    if isinstance(data, Mapping):
+        if "uids" not in data:
+            raise ValueError(
+                f"needed_uids JSON object must contain a `uids` field: {path.expanduser().resolve()}"
+            )
+        raw_uids = data["uids"]
+    else:
+        raw_uids = data
+
+    if not isinstance(raw_uids, list):
+        raise ValueError(
+            f"needed_uids JSON must provide a list of UIDs: {path.expanduser().resolve()}"
+        )
+
+    return _dedupe_preserve_order([_normalize_uid(uid) for uid in raw_uids])
+
+
+def _load_needed_uids_txt(path: Path) -> List[str]:
+    """Load needed UIDs from a plain text file with one UID per line."""
+
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"needed_uids text file does not exist: {resolved}")
+
+    uids: List[str] = []
+    with resolved.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            uids.append(_normalize_uid(stripped))
+    return _dedupe_preserve_order(uids)
+
+
+def _load_uid_to_path_json(path: Path) -> Dict[str, str]:
+    """Load uid -> image path mapping."""
+
+    data = _load_json_file(path, label="uid_to_path")
+    if not isinstance(data, Mapping):
+        raise ValueError(f"uid_to_path JSON must be an object/dict: {path.expanduser().resolve()}")
+
+    mapping: Dict[str, str] = {}
+    for key, value in data.items():
+        uid = _normalize_uid(key)
+        if value is None:
+            continue
+        mapping[uid] = str(value)
+    return mapping
+
+
+def _write_uid_list_txt(path: Path, values: Sequence[str]) -> None:
+    """Write one string per line."""
+
+    resolved = path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("w", encoding="utf-8") as handle:
+        for value in values:
+            handle.write(f"{value}\n")
+
+
+def _write_uid_list_json(path: Path, values: Sequence[str], *, field_name: str) -> None:
+    """Write a compact JSON payload for UID lists."""
+
+    resolved = path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        field_name: list(values),
+        f"num_{field_name}": len(values),
+    }
+    with resolved.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def _load_needed_uids(
+    needed_uids_json: Optional[str],
+    needed_uids_txt: Optional[str],
+) -> List[str]:
+    """Load and merge needed UIDs from JSON and/or text files."""
+
+    merged: List[str] = []
+    if needed_uids_json:
+        merged.extend(_load_needed_uids_json(Path(needed_uids_json)))
+    if needed_uids_txt:
+        merged.extend(_load_needed_uids_txt(Path(needed_uids_txt)))
+    return _dedupe_preserve_order(merged)
+
+
 def _load_encoder(
     encoder_cls: Any,
     checkpoint_path: Path,
@@ -206,11 +336,18 @@ def _build_effnet_transform(resolution: int) -> transforms.Compose:
 def _collect_image_records(
     image_path: Optional[str],
     image_dir: Optional[str],
+    needed_uids_json: Optional[str],
+    needed_uids_txt: Optional[str],
+    uid_to_path_json: Optional[str],
+    skip_missing_uids: bool,
     max_images: Optional[int],
-) -> List[ImageRecord]:
+    missing_uids_txt: Optional[str],
+    missing_uids_json: Optional[str],
+) -> Tuple[List[ImageRecord], List[str]]:
     """Resolve input image paths from CLI options."""
 
     records: List[ImageRecord] = []
+    missing_uids: List[str] = []
 
     if image_path:
         path = Path(image_path).expanduser().resolve()
@@ -230,12 +367,38 @@ def _collect_image_records(
             if path.is_file() and path.suffix.lower() in image_suffixes:
                 records.append(ImageRecord(image_path=str(path)))
 
+    needed_uids = _load_needed_uids(needed_uids_json, needed_uids_txt)
+    if needed_uids:
+        if not uid_to_path_json:
+            raise ValueError(
+                "UID list input requires --uid-to-path-json so image UIDs can be resolved into file paths."
+            )
+        uid_to_path = _load_uid_to_path_json(Path(uid_to_path_json))
+        for uid in needed_uids:
+            mapped_path = uid_to_path.get(uid)
+            if mapped_path is None:
+                if skip_missing_uids:
+                    missing_uids.append(uid)
+                    continue
+                raise KeyError(f"UID was not found in uid_to_path mapping: {uid}")
+
+            path = Path(mapped_path).expanduser()
+            if not path.exists():
+                if skip_missing_uids:
+                    missing_uids.append(uid)
+                    continue
+                raise FileNotFoundError(
+                    f"Resolved image path for uid={uid} does not exist: {path.resolve()}"
+                )
+            records.append(ImageRecord(image_path=str(path.resolve()), uid=uid))
+
     deduped: List[ImageRecord] = []
-    seen: set[str] = set()
+    seen: set[Tuple[Optional[str], str]] = set()
     for record in records:
-        if record.image_path in seen:
+        record_key = (record.uid, record.image_path)
+        if record_key in seen:
             continue
-        seen.add(record.image_path)
+        seen.add(record_key)
         deduped.append(record)
 
     if not deduped:
@@ -244,7 +407,13 @@ def _collect_image_records(
     if max_images is not None and max_images > 0:
         deduped = deduped[:max_images]
 
-    return deduped
+    missing_uids = _dedupe_preserve_order(missing_uids)
+    if missing_uids_txt and missing_uids:
+        _write_uid_list_txt(Path(missing_uids_txt), missing_uids)
+    if missing_uids_json and missing_uids:
+        _write_uid_list_json(Path(missing_uids_json), missing_uids, field_name="missing_uids")
+
+    return deduped, missing_uids
 
 
 def _load_pil_image(path: Path) -> Image.Image:
@@ -306,6 +475,7 @@ def _make_batch(
         infos.append(
             {
                 "image_path": str(image_path),
+                "uid": record.uid,
                 "original_size": list(image.size),
             }
         )
@@ -324,23 +494,31 @@ def _apply_optional_scaling(latents: Tensor, apply_scaling: bool) -> Tuple[Tenso
     return latents.add(1.0).div(42.0), "image_embeds = image_embeds.add(1.0).div(42.0)"
 
 
-def _safe_stem(path: Path) -> str:
-    """Convert a path stem into a safe filename stem."""
+def _safe_name(value: str) -> str:
+    """Convert arbitrary text into a path-safe filename stem."""
 
-    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in path.stem)
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
     return safe or "image"
+
+
+def _output_stem_for_record(record: ImageRecord) -> str:
+    """Choose the output stem for one latent artifact."""
+
+    if record.uid:
+        return _safe_name(record.uid)
+    return _safe_name(Path(record.image_path).stem)
 
 
 def _save_latent_bundle(
     output_dir: Path,
-    image_path: Path,
+    record: ImageRecord,
     latent: Tensor,
     metadata: SaveMetadata,
 ) -> Tuple[Path, Path]:
     """Save one latent tensor and its metadata."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = _safe_stem(image_path)
+    stem = _output_stem_for_record(record)
     latent_path = output_dir / f"{stem}.pt"
     meta_path = output_dir / f"{stem}.json"
 
@@ -372,6 +550,7 @@ def _print_environment(
     encoder_root: Path,
     checkpoint_path: Path,
     device: torch.device,
+    num_missing_uids: int,
 ) -> None:
     """Print runtime diagnostics."""
 
@@ -383,6 +562,11 @@ def _print_environment(
     print(f"checkpoint_path: {checkpoint_path}")
     print(f"output_dir: {Path(args.output_dir).expanduser().resolve()}")
     print(f"apply_scaling: {args.apply_scaling}")
+    print(f"needed_uids_json: {Path(args.needed_uids_json).expanduser().resolve() if args.needed_uids_json else None}")
+    print(f"needed_uids_txt: {Path(args.needed_uids_txt).expanduser().resolve() if args.needed_uids_txt else None}")
+    print(f"uid_to_path_json: {Path(args.uid_to_path_json).expanduser().resolve() if args.uid_to_path_json else None}")
+    print(f"skip_missing_uids: {args.skip_missing_uids}")
+    print(f"num_missing_uids: {num_missing_uids}")
     print(f"summary_only: {args.summary_only}")
     print(f"verbose: {args.verbose}")
 
@@ -468,6 +652,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-path", type=str, default=None, help="Single image path.")
     parser.add_argument("--image-dir", type=str, default=None, help="Directory of images.")
+    parser.add_argument(
+        "--needed-uids-json",
+        type=str,
+        default=None,
+        help="JSON file containing a `uids` list or a plain UID list to resolve through uid_to_path.json.",
+    )
+    parser.add_argument(
+        "--needed-uids-txt",
+        type=str,
+        default=None,
+        help="Text file containing one image UID per line.",
+    )
+    parser.add_argument(
+        "--uid-to-path-json",
+        type=str,
+        default=None,
+        help="JSON mapping from image UID to local image path. Required for UID-list input mode.",
+    )
+    parser.add_argument(
+        "--skip-missing-uids",
+        action="store_true",
+        help="Skip UIDs that are missing from uid_to_path.json or point to missing files.",
+    )
+    parser.add_argument(
+        "--missing-uids-txt",
+        type=str,
+        default=None,
+        help="Optional text output path for skipped/missing UIDs.",
+    )
+    parser.add_argument(
+        "--missing-uids-json",
+        type=str,
+        default=None,
+        help="Optional JSON output path for skipped/missing UIDs.",
+    )
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR, help="Directory to save .pt/.json files.")
     parser.add_argument(
         "--encoder-search-root",
@@ -504,7 +723,17 @@ def main() -> int:
         encoder_root = _resolve_encoder_module_root(args.encoder_search_root)
         EfficientNetEncoder = _import_efficientnet_encoder(encoder_root)
         checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path)
-        image_records = _collect_image_records(args.image_path, args.image_dir, args.max_images)
+        image_records, missing_uids = _collect_image_records(
+            args.image_path,
+            args.image_dir,
+            args.needed_uids_json,
+            args.needed_uids_txt,
+            args.uid_to_path_json,
+            args.skip_missing_uids,
+            args.max_images,
+            args.missing_uids_txt,
+            args.missing_uids_json,
+        )
         transform = _build_effnet_transform(DEFAULT_RESOLUTION)
         encoder = _load_encoder(EfficientNetEncoder, checkpoint_path, device)
     except Exception as exc:
@@ -512,7 +741,7 @@ def main() -> int:
         print(str(exc))
         return 1
 
-    _print_environment(args, encoder_root, checkpoint_path, device)
+    _print_environment(args, encoder_root, checkpoint_path, device, num_missing_uids=len(missing_uids))
 
     try:
         batch, image_infos = _make_batch(image_records, transform, device)
@@ -559,8 +788,9 @@ def main() -> int:
             if warning:
                 notes.append(warning)
 
-            latent_path = output_dir / f"{_safe_stem(image_path)}.pt"
+            latent_path = output_dir / f"{_output_stem_for_record(record)}.pt"
             metadata = SaveMetadata(
+                uid=record.uid,
                 original_image_path=str(image_path),
                 latent_path=str(latent_path),
                 latent_shape=latent_stats.shape,
@@ -572,7 +802,7 @@ def main() -> int:
                 checkpoint_path=str(checkpoint_path),
                 notes=notes,
             )
-            saved_pair = _save_latent_bundle(output_dir, image_path, latent, metadata)
+            saved_pair = _save_latent_bundle(output_dir, record, latent, metadata)
             saved_pairs.append(saved_pair)
 
             reloaded_shape = _sanity_reload(saved_pair[0])
@@ -584,7 +814,7 @@ def main() -> int:
 
             if args.verbose and not args.summary_only:
                 print(
-                    f"[{idx}] {image_path} -> shape={latent_stats.shape} "
+                    f"[{idx}] uid={record.uid} path={image_path} -> shape={latent_stats.shape} "
                     f"dtype={latent_stats.dtype} min={latent_stats.min_value:.6f} "
                     f"max={latent_stats.max_value:.6f}"
                 )

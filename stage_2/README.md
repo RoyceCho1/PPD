@@ -1,70 +1,158 @@
-# Stage 2 Organization
+# Stage 2
 
-`stage_2/`는 "핵심 실행 흐름"과 "task별 보조 스크립트"를 분리하는 기준으로 정리한다.
+`stage_2/`는 "유저 임베딩을 Stage C prior에 주입해서 preference pair를 다루는 실험 코드"와, 그 실험에 필요한 manifest/assignment/latent 준비 스크립트를 모아둔 폴더다.
 
-## 분류 기준
+핵심적으로는 아래 흐름으로 이해하면 된다.
 
-루트(`stage_2/`)에는 Stage 2의 주요 코드만 둔다.
+1. Hugging Face preference 데이터셋에서 이미지 UID 기준 lookup manifest를 만든다.
+2. pair assignment 파일에서 실제로 필요한 UID만 추린다.
+3. 해당 UID의 raw image를 Stage C clean latent 후보로 변환한다.
+4. 저장된 latent들을 다시 manifest로 인덱싱한다.
+5. Stage 2 dataset으로 user embedding + preference pair를 읽는다.
+6. Stage C attention block에 user-conditioning branch를 patch해서 forward smoke test를 돌린다.
 
-- 데이터셋 정의
-- 핵심 모델 모듈
-- 핵심 패치 로직
-- 메인 forward / smoke test 코드
-- Stage 2의 기본 입출력 포맷을 직접 다루는 대표 스크립트
+## 핵심 파일
 
-즉, 다른 코드가 자주 import하거나 Stage 2의 기본 흐름을 설명할 때 바로 언급되는 파일은 루트에 남긴다.
+### [stage2_dataset.py](/data/roycecho/PPD/stage_2/stage2_dataset.py)
 
-하위 폴더에는 task 성격이 강한 보조 코드를 둔다.
+Stage 2의 메인 데이터셋 정의다.
 
-- 특정 데이터 준비 작업용 스크립트
-- 일회성 또는 배치 실행용 생성기
-- 분석/점검/추적용 스크립트
-- 특정 실험 단계에서만 쓰는 유틸리티
+- user 단위 JSON을 읽어서 pair 단위 sample로 flatten한다.
+- `preferred_image_uid_{i}`, `dispreferred_image_uid_{i}`, `caption_{i}` 형태의 필드를 파싱한다.
+- user embedding(`emb`)을 tensor로 바꾸고 shape 검증을 한다.
+- 선택적으로 `uid_to_path.json`, `uid_to_meta.json`을 붙여서 이미지 경로나 UID 메타데이터를 함께 제공한다.
+- `collate_fn`까지 포함한 학습/실험 입력 포맷의 기준점 역할을 한다.
 
-즉, "있으면 편하지만 Stage 2의 중심 축은 아닌 코드"는 task 또는 analysis 폴더로 내린다.
+즉, Stage 2에서 "무엇을 한 샘플로 볼 것인가"를 정의하는 파일이다.
 
-## 현재 구조
+### [user_adapter.py](/data/roycecho/PPD/stage_2/user_adapter.py)
 
-### 루트
+유저 임베딩을 Stage C attention에 넣기 위한 모듈이다.
 
-아래 파일들은 Stage 2의 주요 흐름을 구성하므로 루트에 둔다.
+- `UserProjection`: `[B, L, 3584]` 형태의 user embedding을 cross-attention token 공간으로 projection한다.
+- `UserCrossAttentionAdapter`: diffusion hidden state를 query로, user token을 key/value로 써서 별도 cross-attention residual을 만든다.
 
-- `stage2_dataset.py`
-- `user_adapter.py`
-- `patch_stage_c.py`
-- `forward_only_stage2.py`
-- `prepare_stage_c_latents.py`
-- `build_latent_manifest.py`
+즉, "유저 임베딩을 어떤 방식으로 조건(condition)으로 넣을지"를 담당한다.
 
-### `tasks/`
+### [patch_stage_c.py](/data/roycecho/PPD/stage_2/patch_stage_c.py)
 
-`tasks/`는 결과물을 만들기 위한 작업 단위별 보조 스크립트를 둔다.
+Stable Cascade Stage C의 attention block에 user-conditioning branch를 삽입하는 패치 유틸이다.
 
-- `tasks/hf_manifest/`
-  - Hugging Face 데이터셋에서 UID manifest를 만드는 작업
-- `tasks/pair_assignment/`
-  - pair pool 생성
-  - Stage 2 pair assignment 생성
-  - shard 단위 batch 실행
+- 기존 `SDCascadeAttnBlock`를 감싸는 `PatchedSDCascadeAttnBlock`을 제공한다.
+- 원래 text-conditioning 경로는 유지한 채, user branch residual을 병렬로 더한다.
+- 특정 block path만 골라 patch할 수 있다.
+- backbone freeze와 trainable parameter summary 유틸도 같이 제공한다.
 
-### `analysis/`
+즉, "기존 Stage C를 어디까지 유지하고 어떤 지점에 user branch를 덧붙일지"를 담당한다.
 
-`analysis/`는 모델 구조 확인, 경로 추적, 샘플 점검처럼 분석 목적의 스크립트를 둔다.
+### [forward_only_stage2.py](/data/roycecho/PPD/stage_2/forward_only_stage2.py)
 
-- `analysis/stage_c/`
-  - Stage C 구조 분석
-  - target path 추적
-  - clean target 관련 조사
-- `analysis/user/`
-  - user preference 샘플 확인
+Stage 2 통합 smoke test 스크립트다.
 
-## 정리 원칙
+- `Stage2PreferenceDataset`에서 batch를 하나 뽑는다.
+- Stable Cascade prior pipeline과 text encoder를 로드한다.
+- Stage C에 user adapter patch를 적용한다.
+- text conditioning + user conditioning을 함께 넣어 forward만 실행한다.
 
-새 파일을 추가할 때는 아래 기준을 따른다.
+이 스크립트는 학습 코드가 아니라, 데이터셋과 patch가 실제로 연결되는지 확인하는 데 목적이 있다.
 
-1. 다른 Stage 2 코드가 직접 import하는 핵심 모듈이면 루트에 둔다.
-2. 특정 작업을 수행하는 생성기나 배치 실행기면 `tasks/` 아래에 둔다.
-3. 결과를 만들기보다 확인, 추적, 진단이 목적이면 `analysis/` 아래에 둔다.
-4. task 폴더는 "기술명"보다 "업무 단위" 기준으로 나눈다.
+## Latent / Manifest 준비
 
-이 기준으로도 애매하면, 일단 루트에 두지 말고 적절한 task 폴더를 먼저 만드는 쪽을 기본값으로 한다.
+### [tasks/hf_manifest/build_uid_manifest_from_hf.py](/data/roycecho/PPD/stage_2/tasks/hf_manifest/build_uid_manifest_from_hf.py)
+
+Hugging Face preference 데이터셋을 스캔해서 UID 기준 lookup 파일을 만든다.
+
+- `uid_to_path.json`: `image_uid -> image path`
+- `uid_to_meta.json`: `image_uid -> 집계 메타데이터`
+
+수집하는 메타데이터에는 대략 아래가 포함된다.
+
+- 등장 횟수
+- best / non-best 등장 횟수
+- split별 카운트
+- caption 샘플
+- partner UID 샘플
+- source path 샘플
+
+필요하면 이미지 바이너리를 로컬 디렉토리에 UID 이름으로 저장하는 역할도 한다.
+
+즉, HF 데이터셋을 Stage 2에서 바로 쓰기보다, UID 중심 manifest로 한 번 정리하는 전처리 단계다.
+
+### [extract_needed_uids_from_assignments.py](/data/roycecho/PPD/stage_2/extract_needed_uids_from_assignments.py)
+
+`stage2_pair_assignments*.jsonl`에서 실제로 참조되는 이미지 UID만 추출한다.
+
+- 기본적으로 `query_pairs`의 UID를 모은다.
+- 옵션으로 `support_pairs`까지 포함할 수 있다.
+- 결과를 txt/json으로 저장한다.
+
+즉, "manifest에 있는 전체 UID"가 아니라 "현재 assignment가 실제로 쓰는 UID 부분집합"을 뽑는 스크립트다.
+
+### [image_to_latents.py](/data/roycecho/PPD/stage_2/image_to_latents.py)
+
+raw image를 Stage C clean latent 후보로 바꾸는 스크립트다.
+
+- local Wuerstchen example의 `EfficientNetEncoder`를 불러온다.
+- image transform을 적용한 뒤 encoder forward를 수행한다.
+- 필요 시 scaling rule까지 적용한다.
+- 각 UID/image마다 latent tensor와 metadata를 저장한다.
+- UID 목록 + `uid_to_path.json`을 이용해 필요한 이미지 subset만 처리할 수 있다.
+
+이 스크립트는 학습을 하지 않고, latent artifact를 준비하는 데만 집중한다.
+
+### [build_latent_manifest.py](/data/roycecho/PPD/stage_2/build_latent_manifest.py)
+
+이미 저장된 latent `.pt` 파일을 다시 스캔해서 `latent_manifest.jsonl`을 만든다.
+
+- latent를 새로 생성하지는 않는다.
+- 각 `.pt` 파일에서 UID, tensor shape, dtype, 통계값을 읽는다.
+- 필요하면 `uid_to_path.json`, `uid_to_meta.json`을 붙여 manifest를 enrich한다.
+
+즉, latent 폴더를 모델 입력용 lookup manifest로 인덱싱하는 역할이다.
+
+## Pair Assignment 작업
+
+### [tasks/pair_assignment/build_pair_pool_from_hf.py](/data/roycecho/PPD/stage_2/tasks/pair_assignment/build_pair_pool_from_hf.py)
+
+HF preference 데이터셋에서 Stage 2 pair assignment의 재료가 되는 pair pool을 만드는 스크립트다.
+
+### [tasks/pair_assignment/build_stage2_pair_assignments.py](/data/roycecho/PPD/stage_2/tasks/pair_assignment/build_stage2_pair_assignments.py)
+
+pair pool을 바탕으로 Stage 2에서 사용할 assignment JSONL을 생성하는 스크립트다.
+
+### [tasks/pair_assignment/run_build_stage2_pair_assignments_all.py](/data/roycecho/PPD/stage_2/tasks/pair_assignment/run_build_stage2_pair_assignments_all.py)
+
+assignment 생성 작업을 shard 단위로 여러 번 실행하는 배치 runner다.
+
+## Analysis 스크립트
+
+`analysis/` 아래 파일들은 결과를 생산하는 메인 파이프라인보다는 확인과 추적에 가깝다.
+
+### `analysis/stage_c/`
+
+- `inspect_stage_c.py`: Stage C 구조를 확인한다.
+- `inspect_stage_c_target_path.py`: patch 후보 path를 확인한다.
+- `trace_stage_c_clean_target.py`: clean target 관련 경로를 추적한다.
+
+### `analysis/user/`
+
+- `inspect_user_preferences.py`: user preference 샘플과 데이터 형태를 점검한다.
+
+## 권장 이해 순서
+
+처음 코드를 읽을 때는 아래 순서가 가장 자연스럽다.
+
+1. `stage2_dataset.py`
+2. `user_adapter.py`
+3. `patch_stage_c.py`
+4. `forward_only_stage2.py`
+5. `tasks/hf_manifest/build_uid_manifest_from_hf.py`
+6. `extract_needed_uids_from_assignments.py`
+7. `image_to_latents.py`
+8. `build_latent_manifest.py`
+
+앞의 1~4는 "모델 쪽 핵심 흐름", 뒤의 5~8은 "입력 데이터와 latent artifact 준비 흐름"이다.
+
+## 한 줄로 요약하면
+
+`stage_2/`는 "user preference 기반 Stage 2 실험을 위한 모델 패치 코드"와 "그 실험에 필요한 UID manifest / pair assignment / latent 준비 스크립트"를 함께 모아둔 폴더다.
