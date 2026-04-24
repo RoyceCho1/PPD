@@ -1,6 +1,6 @@
 import os
-os.environ["HF_HOME"] = "/var/tmp/roycecho_hf"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ.setdefault("HF_HOME", "/Data_Storage/roycecho/PPD/hf_cache")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 from llava.model.builder import load_pretrained_model
 from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token

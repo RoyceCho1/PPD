@@ -116,14 +116,79 @@ def _parse_patch_paths(raw_paths: Optional[Sequence[str]]) -> List[str]:
 def _load_dataset(args: argparse.Namespace) -> Stage2PreferenceDataset:
     # Stage 2 preference dataset 로드
 
-    uid_to_path = args.uid_to_path_json_path if args.uid_to_path_json_path and args.uid_to_path_json_path.exists() else None
+    uid_to_path = (
+        args.uid_to_path_json_path
+        if args.uid_to_path_json_path and args.uid_to_path_json_path.exists()
+        else None
+    )
+    assignment_path = args.assignment_jsonl_path
+    latent_manifest_path = args.latent_manifest_jsonl_path
+    has_assignment = assignment_path is not None
+    has_manifest = latent_manifest_path is not None
+
+    if has_assignment and not assignment_path.exists():
+        raise FileNotFoundError(f"--assignment-jsonl-path not found: {assignment_path}")
+    if has_manifest and not latent_manifest_path.exists():
+        raise FileNotFoundError(f"--latent-manifest-jsonl-path not found: {latent_manifest_path}")
+
+    if has_assignment != has_manifest:
+        raise ValueError(
+            "Provide both --assignment-jsonl-path and --latent-manifest-jsonl-path together, "
+            "or omit both (legacy mode), or pass --use-dummy-sample."
+        )
+
+    wants_real_latents = (not args.use_dummy_sample) and has_assignment and has_manifest
+
     return Stage2PreferenceDataset(
         embedding_json_path=args.embedding_json_path,
+        assignment_jsonl_path=assignment_path,
+        latent_manifest_jsonl_path=latent_manifest_path,
         uid_to_path_json_path=uid_to_path,
         uid_to_meta_json_path=None,
         load_images=False,
+        load_latents=wants_real_latents,
+        skip_missing_latents=args.skip_missing_latents,
+        validate_assignment_support_pairs=args.validate_assignment_support_pairs,
         skip_malformed_pairs=True,
     )
+
+
+def _is_real_latent_mode(args: argparse.Namespace) -> bool:
+    return (
+        (not args.use_dummy_sample)
+        and args.assignment_jsonl_path is not None
+        and args.latent_manifest_jsonl_path is not None
+    )
+
+
+def _extract_real_sample_from_batch(
+    batch: Mapping[str, Any],
+    latent_source: str,
+    prior: nn.Module,
+    device: torch.device,
+) -> Tensor:
+    """Build prior sample from real latent tensors in one dataset batch."""
+
+    if latent_source not in {"preferred", "dispreferred"}:
+        raise ValueError(f"Unsupported latent_source={latent_source}. Expected preferred or dispreferred.")
+
+    key = f"{latent_source}_latent"
+    if key not in batch:
+        raise ValueError(
+            f"Batch does not contain `{key}`. Ensure real-latent mode is enabled "
+            "(assignment + latent manifest + load_latents)."
+        )
+
+    sample = batch[key]
+    if not isinstance(sample, Tensor):
+        raise TypeError(f"Batch key `{key}` must be a Tensor after collation, got: {type(sample)}")
+    if sample.ndim != 4:
+        raise ValueError(f"Real latent sample must be 4D [B,C,H,W], got shape={tuple(sample.shape)}")
+    if int(sample.shape[1]) != 16:
+        raise ValueError(f"Expected latent channel dimension C=16, got shape={tuple(sample.shape)}")
+
+    prior_dtype = _get_prior_dtype(prior)
+    return sample.to(device=device, dtype=prior_dtype if sample.is_floating_point() else torch.float32)
 
 
 def _get_one_batch(dataset: Stage2PreferenceDataset, batch_size: int) -> Mapping[str, Any]:
@@ -475,7 +540,7 @@ def _print_case_result(result: ForwardCaseResult, summary_only: bool) -> None:
     print("clip_img shape:", result.clip_img_shape)
     print("user_emb shape:", result.user_emb_shape)
     print("user_emb_attention_mask shape:", result.user_mask_shape)
-    print("dummy sample shape:", result.sample_shape)
+    print("sample shape:", result.sample_shape)
     print("model output shape:", result.output_shape)
     print("dtype:", result.dtype)
     print("device:", result.device)
@@ -493,7 +558,43 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/user_emb_7b_full/test_shard0.json"),
     )
+    parser.add_argument(
+        "--assignment-jsonl-path",
+        type=Path,
+        default=None,
+        help="Stage 2 assignment JSONL. Required for real-latent mode.",
+    )
+    parser.add_argument(
+        "--latent-manifest-jsonl-path",
+        type=Path,
+        default=None,
+        help="Latent manifest JSONL. Required for real-latent mode.",
+    )
     parser.add_argument("--uid-to-path-json-path", type=Path, default=Path("data/uid_to_path.json"))
+    parser.add_argument(
+        "--skip-missing-latents",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip samples missing preferred/dispreferred latent entries (default: False).",
+    )
+    parser.add_argument(
+        "--validate-assignment-support-pairs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Validate assignment support pairs against Stage 1 embedding rows (default: True).",
+    )
+    parser.add_argument(
+        "--latent-source",
+        type=str,
+        default="preferred",
+        choices=("preferred", "dispreferred"),
+        help="Which latent tensor to use as prior sample in real-latent mode.",
+    )
+    parser.add_argument(
+        "--use-dummy-sample",
+        action="store_true",
+        help="Force legacy dummy-sample mode (no assignment/manifest latent sample usage).",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--patch-path",
@@ -529,6 +630,8 @@ def main() -> int:
 
     args = _build_parser().parse_args()
     passed = False
+    real_latent_mode = _is_real_latent_mode(args)
+    mode_name = "real-latent mode" if real_latent_mode else "dummy-sample mode"
 
     try:
         device = _resolve_device(args.device)
@@ -573,23 +676,54 @@ def main() -> int:
         user_emb = batch["user_emb"].to(device=device, dtype=_get_prior_dtype(prior))
         user_mask = batch["user_emb_attention_mask"].to(device=device)
         zero_user_emb = torch.zeros_like(user_emb)
-        sample = make_dummy_sample(prior=prior, batch_size=len(captions), device=device)
+        if not real_latent_mode:
+            sample = make_dummy_sample(prior=prior, batch_size=len(captions), device=device)
+        else:
+            sample = _extract_real_sample_from_batch(
+                batch=batch,
+                latent_source=args.latent_source,
+                prior=prior,
+                device=device,
+            )
+
         clip_img = None
         if not args.skip_image_case:
-            images = _load_batch_images(batch=batch, image_source=args.image_source)
-            clip_img = _encode_clip_images(pipe=pipe, images=images, device=device)
-            clip_img = clip_img.to(device=device, dtype=_get_prior_dtype(prior))
+            try:
+                images = _load_batch_images(batch=batch, image_source=args.image_source)
+                clip_img = _encode_clip_images(pipe=pipe, images=images, device=device)
+                clip_img = clip_img.to(device=device, dtype=_get_prior_dtype(prior))
+            except Exception as image_exc:
+                print(
+                    "[forward_only_stage2] warning: image case will be skipped due to image loading/encoding failure: "
+                    f"{image_exc}"
+                )
+                clip_img = None
     except Exception:
         print("[forward_only_stage2] conditioning/sample preparation failure")
         print(traceback.format_exc().strip())
         print("\nforward-only integration test failed")
         return 3
 
+    dataset_stats = dataset.get_stats()
     if not args.summary_only:
-        print("[forward_only_stage2] dataset stats:", dataset.get_stats())
+        selected_stats = {
+            "num_samples": dataset_stats.get("num_samples"),
+            "num_query_samples": dataset_stats.get("num_query_samples"),
+            "missing_latents_skipped": dataset_stats.get("missing_latents_skipped"),
+        }
+        print("[forward_only_stage2] dataset stats:", selected_stats)
     print("[forward_only_stage2] patched paths:", patch_summary.patched_paths)
     print("[forward_only_stage2] trainable parameters:", trainable_summary.trainable_parameters)
     print("[forward_only_stage2] trainable tensors:", trainable_summary.trainable_tensors)
+    print("[forward_only_stage2] mode:", mode_name)
+    print("[forward_only_stage2] latent source:", args.latent_source if real_latent_mode else "dummy")
+    print("[forward_only_stage2] sample shape:", tuple(sample.shape))
+    print("[forward_only_stage2] sample dtype:", str(sample.dtype))
+    if real_latent_mode:
+        latent_path_key = f"{args.latent_source}_latent_path"
+        latent_paths = batch.get(latent_path_key)
+        if isinstance(latent_paths, list) and latent_paths:
+            print("[forward_only_stage2] first latent paths:", latent_paths[:2])
 
     results: List[ForwardCaseResult] = []
     try:

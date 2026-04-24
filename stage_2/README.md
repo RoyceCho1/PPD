@@ -78,7 +78,7 @@ Hugging Face preference 데이터셋을 스캔해서 UID 기준 lookup 파일을
 
 즉, HF 데이터셋을 Stage 2에서 바로 쓰기보다, UID 중심 manifest로 한 번 정리하는 전처리 단계다.
 
-### [extract_needed_uids_from_assignments.py](/data/roycecho/PPD/stage_2/extract_needed_uids_from_assignments.py)
+### [tasks/latent/extract_needed_uids_from_assignments.py](/data/roycecho/PPD/stage_2/tasks/latent/extract_needed_uids_from_assignments.py)
 
 `stage2_pair_assignments*.jsonl`에서 실제로 참조되는 이미지 UID만 추출한다.
 
@@ -88,7 +88,7 @@ Hugging Face preference 데이터셋을 스캔해서 UID 기준 lookup 파일을
 
 즉, "manifest에 있는 전체 UID"가 아니라 "현재 assignment가 실제로 쓰는 UID 부분집합"을 뽑는 스크립트다.
 
-### [image_to_latents.py](/data/roycecho/PPD/stage_2/image_to_latents.py)
+### [tasks/latent/image_to_latents.py](/data/roycecho/PPD/stage_2/tasks/latent/image_to_latents.py)
 
 raw image를 Stage C clean latent 후보로 바꾸는 스크립트다.
 
@@ -100,7 +100,7 @@ raw image를 Stage C clean latent 후보로 바꾸는 스크립트다.
 
 이 스크립트는 학습을 하지 않고, latent artifact를 준비하는 데만 집중한다.
 
-### [build_latent_manifest.py](/data/roycecho/PPD/stage_2/build_latent_manifest.py)
+### [tasks/latent/build_latent_manifest.py](/data/roycecho/PPD/stage_2/tasks/latent/build_latent_manifest.py)
 
 이미 저장된 latent `.pt` 파일을 다시 스캔해서 `latent_manifest.jsonl`을 만든다.
 
@@ -147,11 +147,13 @@ assignment 생성 작업을 shard 단위로 여러 번 실행하는 배치 runne
 3. `patch_stage_c.py`
 4. `forward_only_stage2.py`
 5. `tasks/hf_manifest/build_uid_manifest_from_hf.py`
-6. `extract_needed_uids_from_assignments.py`
-7. `image_to_latents.py`
-8. `build_latent_manifest.py`
+6. `tasks/latent/extract_needed_uids_from_assignments.py`
+7. `tasks/latent/image_to_latents.py`
+8. `tasks/latent/build_latent_manifest.py`
 
 앞의 1-4는 "모델 쪽 핵심 흐름", 뒤의 5-8은 "입력 데이터와 latent artifact 준비 흐름"이다.
+
+`stage_2/` top-level에는 호환성 유지를 위한 얇은 wrapper 파일이 일부 남아 있고, 실제 latent 준비 구현은 `tasks/latent/` 아래에 모여 있다.
 
 ## 한 줄로 요약하면
 

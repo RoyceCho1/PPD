@@ -1,12 +1,13 @@
 outputs*/
-data/
+data
 emb_data/
 downloaded_pickapic_v2/
 *.egg-info/
 wandb/
 checkpoints/
 stage_2/artifacts/
-artifacts/
+artifacts
+stage2_latents
 *.pdf
 
 # Byte-compiled / optimized / DLL files

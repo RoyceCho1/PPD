@@ -18,9 +18,8 @@ not perform training.
 """
 
 import os
-
-os.environ["HF_HOME"] = "/var/tmp/roycecho_hf"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ.setdefault("HF_HOME", "/Data_Storage/roycecho/PPD/hf_cache")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 import argparse
 import json
