@@ -405,7 +405,8 @@ def patch_stage_c_with_user_adapter(
 
 
 def freeze_stage_c_except_user_modules(model: nn.Module) -> None:
-    # stage c의 attention block을 제외한 나머지 parameter를 freeze
+    # Freeze the Stage C backbone and keep only the user-conditioning trainable
+    # subset needed for preference smoke training.
     for param in model.parameters():
         param.requires_grad = False # freeze everything
 
@@ -414,7 +415,11 @@ def freeze_stage_c_except_user_modules(model: nn.Module) -> None:
             continue
         for param in module.user_projection.parameters(): # user projection parameter
             param.requires_grad = True
-        for param in module.user_adapter.parameters(): # user adapter parameter
+        for param in module.user_adapter.k_proj.parameters(): # user W_k
+            param.requires_grad = True
+        for param in module.user_adapter.v_proj.parameters(): # user W_v
+            param.requires_grad = True
+        for param in module.user_adapter.out_proj.parameters(): # user branch output projection
             param.requires_grad = True
         if isinstance(module.user_scale, nn.Parameter):
             module.user_scale.requires_grad = True # user scale parameter

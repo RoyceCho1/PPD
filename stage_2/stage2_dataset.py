@@ -42,6 +42,9 @@ class Stage2PreferenceDataset(Dataset):
         strict_emb_dim: bool = True, # user embedding의 마지막 차원이 3584가 아니면 에러를 발생시킨다
         expected_emb_dim: int = 3584,
         image_loader: Optional[Callable[[str], Any]] = None,
+        preloaded_uid_to_path: Optional[Mapping[str, Any]] = None,
+        preloaded_uid_to_meta: Optional[Mapping[str, Any]] = None,
+        preloaded_latent_manifest: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> None:
         self.embedding_json_path = Path(embedding_json_path)
         self.assignment_jsonl_path = Path(assignment_jsonl_path) if assignment_jsonl_path else None
@@ -59,10 +62,20 @@ class Stage2PreferenceDataset(Dataset):
         self.expected_emb_dim = expected_emb_dim
         self.image_loader = image_loader or self._default_image_loader
 
-        self._uid_to_path: Dict[str, str] = self._load_optional_mapping(self.uid_to_path_json_path) # dictionary 형태로 저장
-        self._uid_to_meta: Dict[str, Any] = self._load_optional_mapping(self.uid_to_meta_json_path) # dictionary 형태로 저장
-        self._latent_manifest: Dict[str, Dict[str, Any]] = self._load_optional_latent_manifest(
-            self.latent_manifest_jsonl_path
+        self._uid_to_path: Dict[str, str] = (
+            preloaded_uid_to_path  # type: ignore[assignment]
+            if preloaded_uid_to_path is not None
+            else self._load_optional_mapping(self.uid_to_path_json_path)
+        ) # dictionary 형태로 저장
+        self._uid_to_meta: Dict[str, Any] = (
+            preloaded_uid_to_meta  # type: ignore[assignment]
+            if preloaded_uid_to_meta is not None
+            else self._load_optional_mapping(self.uid_to_meta_json_path)
+        ) # dictionary 형태로 저장
+        self._latent_manifest: Dict[str, Dict[str, Any]] = (
+            preloaded_latent_manifest  # type: ignore[assignment]
+            if preloaded_latent_manifest is not None
+            else self._load_optional_latent_manifest(self.latent_manifest_jsonl_path)
         )
 
         raw = self._load_json_file(self.embedding_json_path) # json 파일 로드

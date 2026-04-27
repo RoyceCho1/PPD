@@ -124,7 +124,6 @@ def main(_):
     # =====================================================
     
     if FLAGS.load_4bit:
-        # --- 수정: 4-bit 양자화 상태에서도 사용자가 입력한 device_map을 그대로 따릅니다 ---
         print("=" * 60)
         print(f"[MODE] 4-bit quantization with device_map={device_map_flag}")
         print("=" * 60)
@@ -141,16 +140,12 @@ def main(_):
             d_map = {"": device_index}
         elif device_map_flag == 'auto' and torch.cuda.device_count() == 2:
             print("[HOTFIX] Applying Custom 2-GPU ASYMMETRIC Map to prevent Logit OOM!")
-            # lm_head가 동작할 때 단번에 3.5GB 이상의 메모리가 스파이크되므로, 
-            # GPU 1번(lm_head 위치)의 레이어 비중을 확 줄여서 메모리를 일부러 텅텅 비워둡니다.
             d_map = {}
             d_map['model.vision_tower'] = 0
             d_map['model.vision_resampler'] = 0
             d_map['model.mm_projector'] = 0
             d_map['model.embed_tokens'] = 0
             d_map['model.image_newline'] = 0
-            # 밸런스 튜닝 2차: 18/10 에서는 GPU 0이 44MB 부족, 12/16 에서는 GPU 1이 700MB 부족.
-            # 계산 결과 1레이어당 약 200MB 처리를 요구하므로 '17/11'이 수학적인 완벽한 스윗스팟입니다.
             for i in range(17): d_map[f'model.layers.{i}'] = 0
             for i in range(17, 28): d_map[f'model.layers.{i}'] = 1
             d_map['model.norm'] = 1
@@ -208,9 +203,6 @@ def main(_):
         
         num_gpus = torch.cuda.device_count()
         
-        # [HOTFIX] LLaVA의 load_pretrained_model은 device_map이 dictionary 형태면 내부 버그가 발생합니다.
-        # 하지만 "auto"로 두면 OOM이 일어나므로, python 동적 패칭(Monkey Patching)으로 
-        # transformers 라이브러리의 device_map 자동 생성 함수를 가로채어 완벽한 4-GPU 분산 맵을 강제로 주입합니다.
         import transformers
         original_infer = transformers.modeling_utils.infer_auto_device_map
         
@@ -232,7 +224,6 @@ def main(_):
                 d_map['model.mm_projector'] = 3
                 d_map['lm_head'] = 3
                 
-                # 디스크 및 CPU 오프로드 강제 제거
                 clean_map = {k: v for k, v in d_map.items() if v not in ['cpu', 'disk']}
                 
                 for k in list(clean_map.keys()):
@@ -243,8 +234,7 @@ def main(_):
             
             transformers.modeling_utils.infer_auto_device_map = custom_infer_auto_device_map
 
-        # max_memory 설정은 오히려 디스크 오프로딩을 유발하므로 삭제하고,
-        # 오직 위의 완벽한 custom_infer_auto_device_map 에만 의존합니다.
+
         tokenizer, model, image_processor, max_length = load_pretrained_model(
             pretrained, None, model_name,
             device_map="auto",
@@ -256,7 +246,6 @@ def main(_):
         if device_map_flag == 'auto' and num_gpus == 4:
             transformers.modeling_utils.infer_auto_device_map = original_infer
         
-        # device_map 설정 시 model.to() 호출 금지
         # 입력 텐서의 device는 모델의 첫 번째 파라미터 위치로 결정
         if hasattr(model, 'hf_device_map') and model.hf_device_map:
             print("hf_device_map:", model.hf_device_map)
@@ -268,7 +257,6 @@ def main(_):
             input_device = next(model.parameters()).device
             input_device = str(input_device)
         
-        # [HOTFIX] model.image_newline has to be on the same device as vision_tower output
         try:
             vision_device = next(model.model.vision_tower.parameters()).device
             if hasattr(model.model, 'image_newline'):
