@@ -242,6 +242,10 @@ def _load_and_prepare_models(args: argparse.Namespace, pipe: Any, train_device: 
         max_blocks=None,
         user_emb_dim=3584,
         user_scale=args.user_scale,
+        user_projection_bias=bool(getattr(args, "user_projection_bias", True)),
+        user_projection_norm_affine=bool(getattr(args, "user_projection_norm_affine", True)),
+        user_adapter_projection_bias=bool(getattr(args, "user_adapter_projection_bias", True)),
+        user_adapter_zero_init_out=bool(getattr(args, "user_adapter_zero_init_out", False)),
     )
     freeze_stage_c_except_user_modules(train_prior)
     _validate_trainable_scope(train_prior)

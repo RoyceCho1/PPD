@@ -88,6 +88,8 @@ class SaveMetadata:
     expected_latent_shape: List[int]
     actual_latent_shape: List[int]
     shape_match: bool
+    preprocess_resolution_mode: str
+    effnet_input_size: List[int]
     effnet_preprocess_resolution_mode: str
     effnet_preprocess_resolution: List[int]
     transform_info: Dict[str, Any]
@@ -929,6 +931,8 @@ def _print_environment(
     print(f"prior_resolution_multiple: {args.prior_resolution_multiple}")
     print(f"expected_latent_spatial: {list(expected_latent_spatial)}")
     print(f"shape_policy: {args.shape_policy}")
+    print(f"preprocess_resolution_mode: {args.effnet_preprocess_resolution_mode}")
+    print(f"effnet_input_size: {list(effnet_preprocess_resolution)}")
     print(f"effnet_preprocess_resolution_mode: {args.effnet_preprocess_resolution_mode}")
     print(f"effnet_preprocess_resolution: {list(effnet_preprocess_resolution)}")
     print(f"needed_uids_json: {Path(args.needed_uids_json).expanduser().resolve() if args.needed_uids_json else None}")
@@ -1031,6 +1035,16 @@ def _print_summary(
     print("- `train_stage2_dpo.py` minimal step: clean target/noisy sample 정의가 확정된 뒤 연결.")
     if saved_count > 0:
         print(f"Saved latent bundle count: {saved_count}")
+
+
+def _write_summary_json(summary_path: Path, payload: Mapping[str, Any]) -> None:
+    """Write a machine-readable generation summary."""
+
+    resolved = summary_path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1160,6 +1174,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip images whose latent .pt and metadata .json already exist in --output-dir.",
     )
     parser.add_argument("--device", type=str, default="cpu", help="Torch device, for example cpu or cuda.")
+    parser.add_argument(
+        "--summary-json",
+        type=str,
+        default=None,
+        help="Optional path to save a machine-readable latent generation summary JSON.",
+    )
     parser.add_argument("--summary-only", action="store_true", help="Print a short report.")
     parser.add_argument("--verbose", action="store_true", help="Print extra per-image information.")
     return parser.parse_args()
@@ -1240,6 +1260,8 @@ def main() -> int:
             "target_image_size": [target_height, target_width],
             "prior_resolution_multiple": args.prior_resolution_multiple,
             "expected_latent_spatial": [expected_h, expected_w],
+            "preprocess_resolution_mode": args.effnet_preprocess_resolution_mode,
+            "effnet_input_size": [preprocess_h, preprocess_w],
             "effnet_preprocess_resolution_mode": args.effnet_preprocess_resolution_mode,
             "effnet_preprocess_resolution": [preprocess_h, preprocess_w],
             "resize": "bilinear+antialias",
@@ -1322,6 +1344,8 @@ def main() -> int:
                     expected_latent_shape=expected_shape,
                     actual_latent_shape=actual_shape,
                     shape_match=per_item_match and shape_match,
+                    preprocess_resolution_mode=args.effnet_preprocess_resolution_mode,
+                    effnet_input_size=[preprocess_h, preprocess_w],
                     effnet_preprocess_resolution_mode=args.effnet_preprocess_resolution_mode,
                     effnet_preprocess_resolution=[preprocess_h, preprocess_w],
                     transform_info=transform_info,
@@ -1399,6 +1423,38 @@ def main() -> int:
             num_batches_processed=num_batches_processed,
             elapsed_seconds=time.time() - start_time,
         )
+        if args.summary_json:
+            summary_payload = {
+                "success": True,
+                "output_dir": str(output_dir),
+                "target_image_size": [target_height, target_width],
+                "prior_resolution_multiple": float(args.prior_resolution_multiple),
+                "expected_latent_shape": [1, 16, expected_h, expected_w],
+                "expected_latent_spatial": [expected_h, expected_w],
+                "preprocess_resolution_mode": args.effnet_preprocess_resolution_mode,
+                "effnet_input_size": [preprocess_h, preprocess_w],
+                "effnet_preprocess_resolution_mode": args.effnet_preprocess_resolution_mode,
+                "effnet_preprocess_resolution": [preprocess_h, preprocess_w],
+                "encoder_class": encoder.__class__.__name__,
+                "checkpoint_path": str(checkpoint_path),
+                "scaling_applied": bool(args.apply_scaling),
+                "scaling_expression": scaling_expression,
+                "shape_policy": args.shape_policy,
+                "batch_size": int(args.batch_size),
+                "device": str(device),
+                "num_images_processed": int(num_images_processed),
+                "num_batches_processed": int(num_batches_processed),
+                "num_skipped_existing": int(skipped_existing_count),
+                "num_missing_uids": int(len(missing_uids)),
+                "saved_count": int(saved_count),
+                "latent_stats": asdict(aggregated_selected_stats),
+                "saved_pairs_preview": [
+                    {"latent_path": str(latent_path), "metadata_path": str(meta_path)}
+                    for latent_path, meta_path in saved_pairs_preview
+                ],
+                "elapsed_seconds": float(time.time() - start_time),
+            }
+            _write_summary_json(Path(args.summary_json), summary_payload)
         return 0
     except Exception as exc:
         print("[ERROR] Latent preparation failed.")

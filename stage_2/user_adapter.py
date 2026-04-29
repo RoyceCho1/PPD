@@ -10,7 +10,14 @@ class UserProjection(nn.Module):
     # d_cross: cross-attention token dimension
     # in_dim: input embedding dimension
     # eps: LayerNorm epsilon
-    def __init__(self, d_cross: int, in_dim: int = 3584, eps: float = 1e-5) -> None:
+    def __init__(
+        self,
+        d_cross: int,
+        in_dim: int = 3584,
+        eps: float = 1e-5,
+        bias: bool = True,
+        norm_elementwise_affine: bool = True,
+    ) -> None:
         super().__init__()
         if d_cross <= 0:
             raise ValueError(f"d_cross must be positive, got {d_cross}")
@@ -20,8 +27,8 @@ class UserProjection(nn.Module):
         self.in_dim = in_dim
         self.d_cross = d_cross
 
-        self.proj = nn.Linear(in_dim, d_cross)
-        self.norm = nn.LayerNorm(d_cross, eps=eps)
+        self.proj = nn.Linear(in_dim, d_cross, bias=bias)
+        self.norm = nn.LayerNorm(d_cross, eps=eps, elementwise_affine=norm_elementwise_affine)
 
     def forward(
         self,
@@ -72,6 +79,8 @@ class UserCrossAttentionAdapter(nn.Module):
         eps: float = 1e-5, # layernorm 나눌때 0이 되는거 방지
         use_query_norm: bool = True, # query에 norm 적용 여부
         use_user_norm: bool = True, # user에 norm 적용 여부
+        projection_bias: bool = True,
+        zero_init_out: bool = False,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -94,10 +103,14 @@ class UserCrossAttentionAdapter(nn.Module):
         self.query_norm = nn.LayerNorm(d_model, eps=eps) if use_query_norm else nn.Identity()
         self.user_norm = nn.LayerNorm(d_cross, eps=eps) if use_user_norm else nn.Identity()
 
-        self.q_proj = nn.Linear(d_model, d_model) # W_q
-        self.k_proj = nn.Linear(d_cross, d_model) # W_k
-        self.v_proj = nn.Linear(d_cross, d_model) # W_v
-        self.out_proj = nn.Linear(d_model, d_model) # W_o
+        self.q_proj = nn.Linear(d_model, d_model, bias=projection_bias) # W_q
+        self.k_proj = nn.Linear(d_cross, d_model, bias=projection_bias) # W_k
+        self.v_proj = nn.Linear(d_cross, d_model, bias=projection_bias) # W_v
+        self.out_proj = nn.Linear(d_model, d_model, bias=projection_bias) # W_o
+        if zero_init_out:
+            nn.init.zeros_(self.out_proj.weight)
+            if self.out_proj.bias is not None:
+                nn.init.zeros_(self.out_proj.bias)
 
         self.attn_dropout = nn.Dropout(dropout)
 

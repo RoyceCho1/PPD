@@ -41,12 +41,12 @@ except ImportError:  # pragma: no cover - useful when imported as package module
 
 DEFAULT_PATCH_PATHS = ("down_blocks.0.2", "down_blocks.0.5")
 EXPECTED_USER_EMB_DIM = 3584
-EXPECTED_LATENT_SHAPE = (16, 12, 12)
+EXPECTED_LATENT_SHAPE = (16, 24, 24)
 DEFAULT_EMBEDDING_JSON_PATH = Path("data/user_emb_7b_full/train_shard0.json")
 DEFAULT_ASSIGNMENT_JSONL_PATH = Path(
     "artifacts/pair_assignments/train/stage2_pair_assignments_train_shard0.jsonl"
 )
-DEFAULT_LATENT_MANIFEST_JSONL_PATH = Path("artifacts/stage_c_latents/latent_manifest_train_v512.jsonl")
+DEFAULT_LATENT_MANIFEST_JSONL_PATH = Path("latents/latents_24x24_stability_raw/latent_manifest_train.jsonl")
 DEFAULT_UID_TO_PATH_JSON_PATH = Path("data/train_uid_to_path.json")
 
 
@@ -539,6 +539,9 @@ def user_conditioning_hooks(
     prior: nn.Module,
     user_emb: Optional[Tensor],
     user_emb_attention_mask: Optional[Tensor],
+    inference_user_scale: float = 1.0,
+    residual_l2_terms: Optional[List[Tensor]] = None,
+    residual_diagnostics: Optional[List[Dict[str, Any]]] = None,
 ) -> Iterator[None]:
     """Inject user residual into patched blocks during a forward-only smoke test.
 
@@ -577,8 +580,26 @@ def user_conditioning_hooks(
             user_attention_mask=local_mask,
         )
         user_residual = restore(user_residual)
-        scale = module.user_scale.to(device=output.device, dtype=output.dtype)
-        return output + scale * user_residual
+        scale = module.user_scale.to(device=output.device, dtype=output.dtype) * float(inference_user_scale)
+        scaled_residual = scale * user_residual
+
+        if residual_l2_terms is not None:
+            residual_l2_terms.append(scaled_residual.float().pow(2).mean())
+        if residual_diagnostics is not None:
+            with torch.no_grad():
+                base_norm = torch.linalg.vector_norm(output.detach().float()).item()
+                residual_norm = torch.linalg.vector_norm(scaled_residual.detach().float()).item()
+                residual_diagnostics.append(
+                    {
+                        "module": module.__class__.__name__,
+                        "base_norm": float(base_norm),
+                        "scaled_residual_norm": float(residual_norm),
+                        "residual_ratio": float(residual_norm / (base_norm + 1e-12)),
+                        "checkpoint_user_scale": float(module.user_scale.detach().float().cpu().item()),
+                        "inference_user_scale": float(inference_user_scale),
+                    }
+                )
+        return output + scaled_residual
 
     try:
         for module in prior.modules():

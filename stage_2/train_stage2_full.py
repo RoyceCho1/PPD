@@ -17,7 +17,7 @@ import random
 import re
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -123,10 +123,12 @@ DEFAULT_TRAIN_EMBEDDING_PATTERNS = ["data/user_emb_7b_full/train_shard*.json"]
 DEFAULT_TRAIN_ASSIGNMENT_PATTERNS = [
     "artifacts/pair_assignments/train/stage2_pair_assignments_train_shard*.jsonl"
 ]
-DEFAULT_TRAIN_LATENT_MANIFEST = Path("artifacts/stage_c_latents/latent_manifest_train_v512.jsonl")
+DEFAULT_TRAIN_LATENT_MANIFEST = Path("latents/latents_24x24_stability_raw/latent_manifest_train.jsonl")
 DEFAULT_TRAIN_UID_TO_PATH = Path("data/train_uid_to_path.json")
 DATASET_SCHEMA_VERSION = "stage2_preference_real_latent_v1"
-EXPECTED_LATENT_SHAPE = (16, 12, 12)
+EXPECTED_LATENT_SHAPE = (16, 24, 24)
+EXPECTED_LATENT_SEMANTICS = "stability_train_c_raw_effnet"
+EXPECTED_LATENT_SCALED = False
 
 
 @dataclass(frozen=True)
@@ -143,12 +145,16 @@ class TrainState:
     samples_seen: int = 0
     best_val_loss: Optional[float] = None
     latest_checkpoint_path: Optional[str] = None
+    best_checkpoint_path: Optional[str] = None
     final_loss: Optional[float] = None
     max_grad_norm_observed: float = 0.0
     max_cuda_mem_reserved_mb: float = 0.0
     nan_failures: int = 0
     frozen_integrity_failures: int = 0
     data_errors: int = 0
+    num_archive_checkpoints_kept: int = 0
+    deleted_archive_checkpoints: List[str] = field(default_factory=list)
+    last_retention_step: Optional[int] = None
 
 
 def _load_mapping_json(path: Path) -> Dict[str, Any]:
@@ -177,6 +183,18 @@ def _load_latent_manifest_jsonl(path: Path) -> Dict[str, Dict[str, Any]]:
             uid = record.get("uid")
             if uid is None or (isinstance(uid, str) and uid.strip() == ""):
                 raise ValueError(f"Latent manifest line {line_idx} in {resolved} is missing `uid`.")
+            scaled = record.get("scaled")
+            if scaled is not EXPECTED_LATENT_SCALED:
+                raise ValueError(
+                    f"Latent manifest line {line_idx} in {resolved} has scaled={scaled!r}; "
+                    f"expected {EXPECTED_LATENT_SCALED!r} for {EXPECTED_LATENT_SEMANTICS}."
+                )
+            latent_semantics = record.get("latent_semantics")
+            if latent_semantics != EXPECTED_LATENT_SEMANTICS:
+                raise ValueError(
+                    f"Latent manifest line {line_idx} in {resolved} has latent_semantics={latent_semantics!r}; "
+                    f"expected {EXPECTED_LATENT_SEMANTICS!r}."
+                )
             uid_key = str(uid)
             if uid_key in manifest:
                 raise ValueError(f"Duplicate uid in latent manifest: {uid_key}")
@@ -354,6 +372,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Patch path; may be repeated or comma-separated. Defaults to Stage 1 patch paths.",
     )
     parser.add_argument("--user-scale", type=float, default=1.0)
+    parser.add_argument("--user-residual-l2-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--user-projection-bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use bias in UserProjection.proj (default: True for checkpoint compatibility).",
+    )
+    parser.add_argument(
+        "--user-projection-norm-affine",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use affine weight/bias in UserProjection LayerNorm (default: True for checkpoint compatibility).",
+    )
+    parser.add_argument(
+        "--user-adapter-projection-bias",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use bias in user adapter q/k/v/out projections (default: True for checkpoint compatibility).",
+    )
+    parser.add_argument(
+        "--user-adapter-zero-init-out",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Zero-initialize user adapter out_proj for new runs (default: False for checkpoint compatibility).",
+    )
     parser.add_argument("--dpo-beta", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -364,7 +407,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-grad-norm", type=float, default=1000.0)
     parser.add_argument("--fail-on-nan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--checkpoint-every-steps", type=int, default=500)
+    parser.add_argument("--latest-checkpoint-every-steps", type=int, default=1000)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=10000)
+    parser.add_argument("--keep-last-checkpoints", type=int, default=3)
     parser.add_argument("--val-every-steps", type=int, default=100)
     parser.add_argument("--max-val-batches", type=int, default=20)
     parser.add_argument("--max-consecutive-data-errors", type=int, default=0)
@@ -372,7 +417,157 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--dataset-dry-run", action="store_true")
+    parser.add_argument("--wandb-mode", type=str, default="disabled", choices=("disabled", "offline", "online"))
+    parser.add_argument("--wandb-project", type=str, default="ppd-stage2")
+    parser.add_argument("--wandb-entity", type=str, default="roycecho-gwangju-institute-of-science-and-technology")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-tags", nargs="*", default=None)
+    parser.add_argument("--wandb-run-id", type=str, default=None)
     return parser
+
+
+def _preflight_wandb(args: argparse.Namespace) -> Any:
+    if args.wandb_mode == "disabled":
+        return None
+    try:
+        import wandb  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "W&B logging was requested but `wandb` is not installed in this environment. "
+            "Install it in ppd_stage2 first, e.g. `conda activate ppd_stage2 && pip install wandb`, "
+            "or rerun with `--wandb-mode disabled`."
+        ) from exc
+    return wandb
+
+
+def _wandb_run_name(args: argparse.Namespace, run_dir: Path, train_dataset: "MultiShardStage2PreferenceDataset") -> str:
+    if args.wandb_run_name:
+        return str(args.wandb_run_name)
+    return (
+        f"{run_dir.name}-seed{int(args.seed)}-"
+        f"train{len(train_dataset.shards)}shards-ref{args.reference_device}"
+    )
+
+
+def _init_wandb(
+    *,
+    wandb_module: Any,
+    args: argparse.Namespace,
+    run_dir: Path,
+    train_dataset: "MultiShardStage2PreferenceDataset",
+    val_dataset: Optional["MultiShardStage2PreferenceDataset"],
+    total_micro_steps: int,
+    total_optimizer_steps: int,
+) -> Any:
+    if wandb_module is None:
+        return None
+    init_kwargs: Dict[str, Any] = {
+        "project": args.wandb_project,
+        "name": _wandb_run_name(args, run_dir, train_dataset),
+        "mode": args.wandb_mode,
+        "tags": list(args.wandb_tags or []),
+        "dir": str(run_dir),
+        "config": _jsonable(
+            {
+                "args": vars(args),
+                "critical_config": _critical_config(args),
+                "train_dataset_stats": train_dataset.get_stats(),
+                "val_dataset_stats": val_dataset.get_stats() if val_dataset else None,
+                "total_micro_steps": total_micro_steps,
+                "total_optimizer_steps": total_optimizer_steps,
+                "resume_from": str(args.resume_from) if args.resume_from else None,
+            }
+        ),
+    }
+    if args.wandb_entity:
+        init_kwargs["entity"] = args.wandb_entity
+    if args.wandb_run_id:
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = "allow"
+    run = wandb_module.init(**init_kwargs)
+    run.define_metric("run/optimizer_step")
+    run.define_metric("train/*", step_metric="run/optimizer_step")
+    run.define_metric("val/*", step_metric="run/optimizer_step")
+    run.define_metric("checkpoint/*", step_metric="run/optimizer_step")
+    return run
+
+
+def _wandb_log_train(wandb_run: Any, train_metrics: Mapping[str, Any], state: TrainState) -> None:
+    if wandb_run is None:
+        return
+    payload: Dict[str, Any] = {
+        "run/optimizer_step": int(state.optimizer_step),
+        "run/micro_step": int(state.micro_step),
+        "run/samples_seen": int(state.samples_seen),
+        "train/loss": train_metrics["loss"],
+        "train/total_loss": train_metrics["total_loss"],
+        "train/score_mean": train_metrics["score_mean"],
+        "train/user_residual_l2_penalty": train_metrics["user_residual_l2_penalty"],
+        "train/user_residual_norm": train_metrics["user_residual_norm"],
+        "train/user_base_norm": train_metrics["user_base_norm"],
+        "train/user_residual_ratio": train_metrics["user_residual_ratio"],
+        "train/user_residual_ratio_max": train_metrics["user_residual_ratio_max"],
+        "train/train_pref_err": train_metrics["train_pref_err_mean"],
+        "train/ref_pref_err": train_metrics["ref_pref_err_mean"],
+        "train/train_dispref_err": train_metrics["train_dispref_err_mean"],
+        "train/ref_dispref_err": train_metrics["ref_dispref_err_mean"],
+        "train/grad_norm_pre_clip": train_metrics["grad_norm_pre_clip"],
+        "train/grad_norm_post_clip": train_metrics["grad_norm_post_clip"],
+        "train/lr": train_metrics["lr"],
+        "train/cuda_reserved_mb": train_metrics["cuda_reserved_mb"],
+        "checkpoint/latest_path": state.latest_checkpoint_path,
+        "checkpoint/best_path": state.best_checkpoint_path,
+        "checkpoint/num_archive_kept": state.num_archive_checkpoints_kept,
+    }
+    if state.best_val_loss is not None:
+        payload["run/best_val_loss"] = float(state.best_val_loss)
+    wandb_run.log(_jsonable({key: value for key, value in payload.items() if value is not None}), step=int(state.optimizer_step))
+
+
+def _wandb_log_val(wandb_run: Any, val_metrics: Mapping[str, Any], state: TrainState) -> None:
+    if wandb_run is None:
+        return
+    payload: Dict[str, Any] = {
+        "run/optimizer_step": int(state.optimizer_step),
+        "run/micro_step": int(state.micro_step),
+        "run/samples_seen": int(state.samples_seen),
+        "val/loss": val_metrics["val_loss"],
+        "val/score_mean": val_metrics["val_score_mean"],
+        "val/train_pref_err": val_metrics["val_train_pref_err_mean"],
+        "val/ref_pref_err": val_metrics["val_ref_pref_err_mean"],
+        "val/train_dispref_err": val_metrics["val_train_dispref_err_mean"],
+        "val/ref_dispref_err": val_metrics["val_ref_dispref_err_mean"],
+        "val/batches": val_metrics["val_batches"],
+        "checkpoint/latest_path": state.latest_checkpoint_path,
+        "checkpoint/best_path": state.best_checkpoint_path,
+        "checkpoint/num_archive_kept": state.num_archive_checkpoints_kept,
+    }
+    if state.best_val_loss is not None:
+        payload["run/best_val_loss"] = float(state.best_val_loss)
+    wandb_run.log(_jsonable({key: value for key, value in payload.items() if value is not None}), step=int(state.optimizer_step))
+
+
+def _finish_wandb(wandb_run: Any, *, status: str, summary: Mapping[str, Any]) -> None:
+    if wandb_run is None:
+        return
+    summary_payload = {
+        "run_status": status,
+        "num_micro_steps_completed": summary.get("num_micro_steps_completed"),
+        "num_optimizer_steps_completed": summary.get("num_optimizer_steps_completed"),
+        "samples_seen": summary.get("samples_seen"),
+        "best_val_loss": summary.get("best_val_loss"),
+        "final_loss": summary.get("final_loss"),
+        "latest_checkpoint_path": summary.get("latest_checkpoint_path"),
+        "best_checkpoint_path": summary.get("best_checkpoint_path"),
+        "num_archive_checkpoints_kept": summary.get("num_archive_checkpoints_kept"),
+        "last_retention_step": summary.get("last_retention_step"),
+        "failure_message": str(summary.get("failure_message") or "")[:4000],
+    }
+    try:
+        wandb_run.summary.update(_jsonable(summary_payload))
+        wandb_run.finish()
+    except Exception as exc:
+        print("[train_stage2_full] wandb finish failed:", str(exc))
 
 
 def _natural_sort_key(path: Path) -> Tuple[Any, ...]:
@@ -589,11 +784,15 @@ def _run_pair_pass(
     if bundle.train_device.type == "cuda":
         torch.cuda.empty_cache()
 
+    residual_l2_terms: List[Tensor] = []
+    residual_diagnostics: List[Dict[str, Any]] = []
     if backward:
         with user_conditioning_hooks(
             bundle.train_prior,
             user_emb=user_emb,
             user_emb_attention_mask=user_mask,
+            residual_l2_terms=residual_l2_terms,
+            residual_diagnostics=residual_diagnostics,
         ):
             train_pref_pred = _run_prior(bundle.train_prior, text=train_text, sample=noisy_pref, timesteps=timesteps)
             train_dispref_pred = _run_prior(bundle.train_prior, text=train_text, sample=noisy_dispref, timesteps=timesteps)
@@ -603,6 +802,7 @@ def _run_pair_pass(
                 bundle.train_prior,
                 user_emb=user_emb,
                 user_emb_attention_mask=user_mask,
+                residual_diagnostics=residual_diagnostics,
             ):
                 train_pref_pred = _run_prior(bundle.train_prior, text=train_text, sample=noisy_pref, timesteps=timesteps)
                 train_dispref_pred = _run_prior(bundle.train_prior, text=train_text, sample=noisy_dispref, timesteps=timesteps)
@@ -616,12 +816,26 @@ def _run_pair_pass(
         ref_dispref_err=ref_dispref_err,
         dpo_beta=args.dpo_beta,
     )
+    if residual_l2_terms:
+        residual_l2_penalty = torch.stack(residual_l2_terms).mean()
+    else:
+        residual_l2_penalty = loss_bundle.loss.new_tensor(0.0)
+    total_loss = loss_bundle.loss + float(args.user_residual_l2_weight) * residual_l2_penalty
     if backward:
-        (loss_bundle.loss / float(loss_scale)).backward()
+        (total_loss / float(loss_scale)).backward()
 
     batch_size = len(batch["caption"]) if "caption" in batch else int(preferred.shape[0])
+    residual_norms = [float(item["scaled_residual_norm"]) for item in residual_diagnostics]
+    base_norms = [float(item["base_norm"]) for item in residual_diagnostics]
+    residual_ratios = [float(item["residual_ratio"]) for item in residual_diagnostics]
     return {
         "loss": float(loss_bundle.loss.detach().cpu().item()),
+        "total_loss": float(total_loss.detach().cpu().item()),
+        "user_residual_l2_penalty": float(residual_l2_penalty.detach().cpu().item()),
+        "user_residual_norm": float(sum(residual_norms) / len(residual_norms)) if residual_norms else 0.0,
+        "user_base_norm": float(sum(base_norms) / len(base_norms)) if base_norms else 0.0,
+        "user_residual_ratio": float(sum(residual_ratios) / len(residual_ratios)) if residual_ratios else 0.0,
+        "user_residual_ratio_max": max(residual_ratios) if residual_ratios else 0.0,
         "train_pref_err_mean": _tensor_mean(loss_bundle.train_pref_err),
         "train_dispref_err_mean": _tensor_mean(loss_bundle.train_dispref_err),
         "ref_pref_err_mean": _tensor_mean(loss_bundle.ref_pref_err),
@@ -640,6 +854,12 @@ def _mean_metrics(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
         raise ValueError("Cannot average an empty metrics list.")
     keys = [
         "loss",
+        "total_loss",
+        "user_residual_l2_penalty",
+        "user_residual_norm",
+        "user_base_norm",
+        "user_residual_ratio",
+        "user_residual_ratio_max",
         "train_pref_err_mean",
         "train_dispref_err_mean",
         "ref_pref_err_mean",
@@ -710,6 +930,10 @@ def _critical_config(args: argparse.Namespace) -> Dict[str, Any]:
         "model_id": args.model_id,
         "patch_path": _jsonable(args.patch_path),
         "user_scale": float(args.user_scale),
+        "user_projection_bias": bool(getattr(args, "user_projection_bias", True)),
+        "user_projection_norm_affine": bool(getattr(args, "user_projection_norm_affine", True)),
+        "user_adapter_projection_bias": bool(getattr(args, "user_adapter_projection_bias", True)),
+        "user_adapter_zero_init_out": bool(getattr(args, "user_adapter_zero_init_out", False)),
         "trainable_markers": list(USER_CONDITIONING_NAME_MARKERS),
         "latent_shape": list(EXPECTED_LATENT_SHAPE),
     }
@@ -720,6 +944,15 @@ def _check_resume_compatibility(checkpoint: Mapping[str, Any], args: argparse.Na
     found = checkpoint.get("critical_config")
     if found is None:
         raise RuntimeError("Checkpoint is missing critical_config.")
+    found = dict(found)
+    legacy_defaults = {
+        "user_projection_bias": True,
+        "user_projection_norm_affine": True,
+        "user_adapter_projection_bias": True,
+        "user_adapter_zero_init_out": False,
+    }
+    for key, value in legacy_defaults.items():
+        found.setdefault(key, value)
     mismatches = {key: (found.get(key), value) for key, value in expected.items() if found.get(key) != value}
     if mismatches:
         raise RuntimeError(f"Checkpoint config mismatch: {mismatches}")
@@ -742,6 +975,7 @@ def _save_checkpoint(
     state: TrainState,
     dataset_stats: Mapping[str, Any],
     run_dir: Path,
+    checkpoint_kind: str,
 ) -> str:
     payload = {
         "trainable_state": _collect_trainable_state(bundle.train_prior),
@@ -759,8 +993,44 @@ def _save_checkpoint(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
-    state.latest_checkpoint_path = str(path)
+    if checkpoint_kind == "latest":
+        state.latest_checkpoint_path = str(path)
+    elif checkpoint_kind == "best":
+        state.best_checkpoint_path = str(path)
+    elif checkpoint_kind != "archive":
+        raise ValueError(f"Unknown checkpoint_kind: {checkpoint_kind}")
     return str(path)
+
+
+def _checkpoint_step(path: Path) -> int:
+    match = re.search(r"checkpoint_step_(\d+)\.pt$", path.name)
+    if match is None:
+        return -1
+    return int(match.group(1))
+
+
+def _run_archive_checkpoint_retention(*, run_dir: Path, keep_last: int, state: TrainState) -> List[str]:
+    archive_paths = sorted(run_dir.glob("checkpoint_step_*.pt"), key=_checkpoint_step)
+    keep = max(0, int(keep_last))
+    if keep == 0:
+        to_delete = archive_paths
+        kept: List[Path] = []
+    else:
+        to_delete = archive_paths[:-keep]
+        kept = archive_paths[-keep:]
+
+    deleted: List[str] = []
+    for path in to_delete:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        deleted.append(str(path))
+
+    state.num_archive_checkpoints_kept = len(kept)
+    state.deleted_archive_checkpoints.extend(deleted)
+    state.last_retention_step = int(state.optimizer_step)
+    return deleted
 
 
 def _validate_updated_params(bundle: ModelBundle) -> None:
@@ -817,6 +1087,12 @@ def _train_metrics_row(
         "samples_seen": state.samples_seen,
         "accumulation_count": accumulation_count,
         "loss": averaged["loss"],
+        "total_loss": averaged["total_loss"],
+        "user_residual_l2_penalty": averaged["user_residual_l2_penalty"],
+        "user_residual_norm": averaged["user_residual_norm"],
+        "user_base_norm": averaged["user_base_norm"],
+        "user_residual_ratio": averaged["user_residual_ratio"],
+        "user_residual_ratio_max": averaged["user_residual_ratio_max"],
         "score_mean": averaged["score_mean"],
         "train_pref_err_mean": averaged["train_pref_err_mean"],
         "ref_pref_err_mean": averaged["ref_pref_err_mean"],
@@ -909,6 +1185,10 @@ def _initial_summary(
         "parameter_delta_max_abs": 0.0,
         "failure_message": None,
         "latest_checkpoint_path": None,
+        "best_checkpoint_path": None,
+        "num_archive_checkpoints_kept": 0,
+        "deleted_archive_checkpoints": [],
+        "last_retention_step": None,
         "run_dir": str(run_dir),
         "metrics_train_path": str(run_dir / "metrics_train.jsonl"),
         "metrics_val_path": str(run_dir / "metrics_val.jsonl"),
@@ -933,6 +1213,10 @@ def _update_summary_from_state(summary: Dict[str, Any], state: TrainState) -> No
     summary["max_grad_norm_observed"] = state.max_grad_norm_observed
     summary["max_cuda_mem_reserved_mb"] = state.max_cuda_mem_reserved_mb
     summary["latest_checkpoint_path"] = state.latest_checkpoint_path
+    summary["best_checkpoint_path"] = state.best_checkpoint_path
+    summary["num_archive_checkpoints_kept"] = state.num_archive_checkpoints_kept
+    summary["deleted_archive_checkpoints"] = list(state.deleted_archive_checkpoints)
+    summary["last_retention_step"] = state.last_retention_step
 
 
 def _write_config(run_dir: Path, args: argparse.Namespace, train_dataset: MultiShardStage2PreferenceDataset, val_dataset: Optional[MultiShardStage2PreferenceDataset]) -> None:
@@ -975,12 +1259,22 @@ def main() -> int:
 
     summary: Dict[str, Any] = {}
     state = TrainState()
+    wandb_run: Any = None
 
     try:
+        wandb_module = _preflight_wandb(args)
         if int(args.gradient_accumulation_steps) < 1:
             raise ValueError("--gradient-accumulation-steps must be >= 1.")
         if int(args.num_epochs) < 1:
             raise ValueError("--num-epochs must be >= 1.")
+        if int(args.latest_checkpoint_every_steps) < 0:
+            raise ValueError("--latest-checkpoint-every-steps must be >= 0.")
+        if int(args.checkpoint_every_steps) < 0:
+            raise ValueError("--checkpoint-every-steps must be >= 0.")
+        if int(args.keep_last_checkpoints) < 0:
+            raise ValueError("--keep-last-checkpoints must be >= 0.")
+        if float(args.user_residual_l2_weight) < 0:
+            raise ValueError("--user-residual-l2-weight must be >= 0.")
 
         train_device = _resolve_device(args.device)
         _set_seed(args.seed, train_device)
@@ -1003,6 +1297,16 @@ def main() -> int:
         if args.max_train_steps is not None:
             total_micro_steps = min(total_micro_steps, max(1, int(args.max_train_steps)))
         total_optimizer_steps = _num_batches(total_micro_steps, int(args.gradient_accumulation_steps))
+
+        wandb_run = _init_wandb(
+            wandb_module=wandb_module,
+            args=args,
+            run_dir=run_dir,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            total_micro_steps=total_micro_steps,
+            total_optimizer_steps=total_optimizer_steps,
+        )
 
         pipe = _load_prior_pipeline(args)
         bundle = _load_and_prepare_models(args=args, pipe=pipe, train_device=train_device)
@@ -1038,6 +1342,10 @@ def main() -> int:
             state.samples_seen = int(checkpoint.get("samples_seen", 0))
             state.best_val_loss = checkpoint.get("best_val_loss")
             state.latest_checkpoint_path = str(args.resume_from.expanduser().resolve())
+            best_path = run_dir / "checkpoint_best.pt"
+            if state.best_val_loss is not None and best_path.exists():
+                state.best_checkpoint_path = str(best_path)
+            state.num_archive_checkpoints_kept = len(list(run_dir.glob("checkpoint_step_*.pt")))
             _restore_rng_state(checkpoint.get("rng_state", {}))
             _full_frozen_integrity_check(bundle, optimizer=optimizer)
 
@@ -1122,7 +1430,8 @@ def main() -> int:
                 if frozen_check_every > 0 and state.optimizer_step % frozen_check_every == 0:
                     _full_frozen_integrity_check(bundle, optimizer=optimizer)
 
-                if state.optimizer_step % max(1, int(args.log_every)) == 0 or state.optimizer_step == 1:
+                should_log_status = state.optimizer_step % max(1, int(args.log_every)) == 0 or state.optimizer_step == 1
+                if should_log_status:
                     print(
                         "[train_stage2_full] "
                         f"optimizer_step={state.optimizer_step}/{total_optimizer_steps} "
@@ -1147,7 +1456,18 @@ def main() -> int:
                         state=state,
                         dataset_stats={"train": train_dataset.get_stats(), "val": val_dataset.get_stats() if val_dataset else None},
                         run_dir=run_dir,
+                        checkpoint_kind="archive",
                     )
+                    _run_archive_checkpoint_retention(
+                        run_dir=run_dir,
+                        keep_last=int(args.keep_last_checkpoints),
+                        state=state,
+                    )
+
+                if (
+                    int(args.latest_checkpoint_every_steps) > 0
+                    and state.optimizer_step % int(args.latest_checkpoint_every_steps) == 0
+                ):
                     _save_checkpoint(
                         path=run_dir / "checkpoint_latest.pt",
                         args=args,
@@ -1157,6 +1477,7 @@ def main() -> int:
                         state=state,
                         dataset_stats={"train": train_dataset.get_stats(), "val": val_dataset.get_stats() if val_dataset else None},
                         run_dir=run_dir,
+                        checkpoint_kind="latest",
                     )
 
                 if (
@@ -1189,10 +1510,14 @@ def main() -> int:
                                 "val": val_dataset.get_stats() if val_dataset else None,
                             },
                             run_dir=run_dir,
+                            checkpoint_kind="best",
                         )
+                    _wandb_log_val(wandb_run, val_metrics, state)
 
                 _update_summary_from_state(summary, state)
                 _write_json(summary_path, summary)
+                if should_log_status:
+                    _wandb_log_train(wandb_run, train_metrics, state)
 
             if start_batch == 0 and state.micro_step % train_batches_per_epoch != 0:
                 break
@@ -1206,6 +1531,7 @@ def main() -> int:
             state=state,
             dataset_stats={"train": train_dataset.get_stats(), "val": val_dataset.get_stats() if val_dataset else None},
             run_dir=run_dir,
+            checkpoint_kind="latest",
         )
 
         changed, max_delta = _param_slice_delta(before, bundle.train_prior)
@@ -1215,6 +1541,7 @@ def main() -> int:
             summary["failure_message"] = "Trainable user-conditioning parameter slices did not change."
             _update_summary_from_state(summary, state)
             _write_json(summary_path, summary)
+            _finish_wandb(wandb_run, status="failed", summary=summary)
             return 4
 
         summary["run_status"] = "success"
@@ -1229,9 +1556,10 @@ def main() -> int:
         print("[train_stage2_full] metrics train:", metrics_train_path)
         print("[train_stage2_full] summary:", summary_path)
         print("[train_stage2_full] checkpoint latest:", run_dir / "checkpoint_latest.pt")
+        _finish_wandb(wandb_run, status="success", summary=summary)
         return 0
     except Exception as exc:
-        if _is_oom_error(exc) or isinstance(exc, RuntimeError):
+        if _is_oom_error(exc):
             _print_memory_hint(exc)
         else:
             print("[train_stage2_full] failure:", str(exc))
@@ -1249,6 +1577,7 @@ def main() -> int:
         summary["failure_message"] = traceback.format_exc().strip()
         _update_summary_from_state(summary, state)
         _write_json(summary_path, summary)
+        _finish_wandb(wandb_run, status="failed", summary=summary)
         return 2
 
 

@@ -80,6 +80,10 @@ class PatchedSDCascadeAttnBlock(nn.Module):
         dropout: float = 0.0,
         user_scale: float = 0.0, # user embedding cross-attention의 scale
         trainable_user_scale: bool = True, # user scale을 학습할지 여부
+        user_projection_bias: bool = True,
+        user_projection_norm_affine: bool = True,
+        user_adapter_projection_bias: bool = True,
+        user_adapter_zero_init_out: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         if d_model <= 0:
@@ -93,12 +97,19 @@ class PatchedSDCascadeAttnBlock(nn.Module):
         self.user_emb_dim = user_emb_dim
         self.num_heads = num_heads
 
-        self.user_projection = UserProjection(d_cross=d_cross, in_dim=user_emb_dim)
+        self.user_projection = UserProjection(
+            d_cross=d_cross,
+            in_dim=user_emb_dim,
+            bias=user_projection_bias,
+            norm_elementwise_affine=user_projection_norm_affine,
+        )
         self.user_adapter = UserCrossAttentionAdapter(
             d_model=d_model,
             d_cross=d_cross,
             num_heads=num_heads,
             dropout=dropout,
+            projection_bias=user_adapter_projection_bias,
+            zero_init_out=user_adapter_zero_init_out,
         )
 
         scale = torch.tensor(float(user_scale), dtype=torch.float32)
@@ -337,6 +348,10 @@ def patch_stage_c_with_user_adapter(
     dropout: float = 0.0,
     user_scale: float = 0.0,
     trainable_user_scale: bool = True,
+    user_projection_bias: bool = True,
+    user_projection_norm_affine: bool = True,
+    user_adapter_projection_bias: bool = True,
+    user_adapter_zero_init_out: bool = False,
 ) -> PatchSummary:
     # stage c의 attention block을 patching
 
@@ -385,6 +400,10 @@ def patch_stage_c_with_user_adapter(
             dropout=dropout,
             user_scale=user_scale,
             trainable_user_scale=trainable_user_scale,
+            user_projection_bias=user_projection_bias,
+            user_projection_norm_affine=user_projection_norm_affine,
+            user_adapter_projection_bias=user_adapter_projection_bias,
+            user_adapter_zero_init_out=user_adapter_zero_init_out,
         )
         _set_child_module(model, candidate.path, wrapper) # 기존 attention block을 wrapper로 교체
         patched_paths.append(candidate.path) # patching된 block의 path 저장

@@ -307,6 +307,12 @@ def _resolve_latent_format_version(loaded: Any) -> Optional[Any]:
     return None
 
 
+def _resolve_latent_semantics(loaded: Any) -> Optional[Any]:
+    if isinstance(loaded, Mapping) and "latent_semantics" in loaded:
+        return loaded["latent_semantics"]
+    return None
+
+
 def _to_jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -371,6 +377,7 @@ def _build_manifest_record(
         "shape": [int(dim) for dim in tensor.shape],
         "dtype": str(tensor.dtype).replace("torch.", ""),
         "scaled": _resolve_scaled(loaded, pt_path),
+        "latent_semantics": _to_jsonable(_resolve_latent_semantics(loaded)),
         "source_image_path": _resolve_source_image_path(loaded),
         "latent_format_version": _to_jsonable(_resolve_latent_format_version(loaded)),
         "min": stats["min"],
