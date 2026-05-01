@@ -562,20 +562,23 @@ def user_conditioning_hooks(
                 "PatchedSDCascadeAttnBlock hook expected tensor output, "
                 f"got {type(output)}"
             )
-        query, restore = module._to_token_sequence(output)
-        module._sync_user_modules(reference=query)
+        if not _inputs or not isinstance(_inputs[0], Tensor):
+            raise TypeError("PatchedSDCascadeAttnBlock hook expected the original hidden-state tensor as input[0].")
+        projected_query = module.project_original_attention_query(_inputs[0])
+        _, restore = module._to_token_sequence(output)
+        module._sync_user_modules(reference=projected_query)
 
-        local_user_emb = user_emb.to(device=query.device, dtype=query.dtype)
+        local_user_emb = user_emb.to(device=projected_query.device, dtype=projected_query.dtype)
         local_mask = None
         if user_emb_attention_mask is not None:
-            local_mask = user_emb_attention_mask.to(device=query.device)
+            local_mask = user_emb_attention_mask.to(device=projected_query.device)
 
         user_tokens = module.user_projection(
             user_emb=local_user_emb,
             user_emb_attention_mask=local_mask,
         )
-        user_residual = module.user_adapter(
-            query=query,
+        user_residual = module.user_adapter.forward_with_projected_query(
+            projected_query=projected_query,
             user_tokens=user_tokens,
             user_attention_mask=local_mask,
         )

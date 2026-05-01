@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-"""Epoch-based Stage 2 full training entrypoint.
-
-This is the production-oriented counterpart to the Stage 2 smoke scripts. It
-keeps the Stable Cascade prior backbone frozen and updates only the patched
-user-conditioning branch with the personalized pairwise diffusion-DPO loss.
-"""
-
 import argparse
 import bisect
 import copy
@@ -134,8 +127,8 @@ EXPECTED_LATENT_SCALED = False
 @dataclass(frozen=True)
 class ShardPair:
     shard_id: int
-    embedding_json_path: Path
-    assignment_jsonl_path: Path
+    embedding_json_path: Path # user embedding json 파일 경로
+    assignment_jsonl_path: Path # user pair assignment jsonl 파일 경로
 
 
 @dataclass
@@ -372,6 +365,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Patch path; may be repeated or comma-separated. Defaults to Stage 1 patch paths.",
     )
     parser.add_argument("--user-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--trainable-user-scale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train user_scale in patched user-conditioning blocks (default: True).",
+    )
+    parser.add_argument(
+        "--user-dropout-prob",
+        type=float,
+        default=0.1,
+        help="Training-only probability of zeroing each sample's user embedding while keeping its mask (default: 0.1).",
+    )
     parser.add_argument("--user-residual-l2-weight", type=float, default=0.0)
     parser.add_argument(
         "--user-projection-bias",
@@ -502,6 +507,11 @@ def _wandb_log_train(wandb_run: Any, train_metrics: Mapping[str, Any], state: Tr
         "train/loss": train_metrics["loss"],
         "train/total_loss": train_metrics["total_loss"],
         "train/score_mean": train_metrics["score_mean"],
+        "train/user_dropout_fraction": train_metrics["user_dropout_fraction"],
+        "train/user_scale_mean": train_metrics["user_scale_mean"],
+        "train/user_scale_min": train_metrics["user_scale_min"],
+        "train/user_scale_max": train_metrics["user_scale_max"],
+        "train/user_scale_std": train_metrics["user_scale_std"],
         "train/user_residual_l2_penalty": train_metrics["user_residual_l2_penalty"],
         "train/user_residual_norm": train_metrics["user_residual_norm"],
         "train/user_base_norm": train_metrics["user_base_norm"],
@@ -550,6 +560,9 @@ def _wandb_log_val(wandb_run: Any, val_metrics: Mapping[str, Any], state: TrainS
 def _finish_wandb(wandb_run: Any, *, status: str, summary: Mapping[str, Any]) -> None:
     if wandb_run is None:
         return
+    user_scale_summary = summary.get("user_scale_summary")
+    if not isinstance(user_scale_summary, Mapping):
+        user_scale_summary = {}
     summary_payload = {
         "run_status": status,
         "num_micro_steps_completed": summary.get("num_micro_steps_completed"),
@@ -557,6 +570,10 @@ def _finish_wandb(wandb_run: Any, *, status: str, summary: Mapping[str, Any]) ->
         "samples_seen": summary.get("samples_seen"),
         "best_val_loss": summary.get("best_val_loss"),
         "final_loss": summary.get("final_loss"),
+        "user_scale_mean": user_scale_summary.get("mean"),
+        "user_scale_min": user_scale_summary.get("min"),
+        "user_scale_max": user_scale_summary.get("max"),
+        "user_scale_std": user_scale_summary.get("std"),
         "latest_checkpoint_path": summary.get("latest_checkpoint_path"),
         "best_checkpoint_path": summary.get("best_checkpoint_path"),
         "num_archive_checkpoints_kept": summary.get("num_archive_checkpoints_kept"),
@@ -706,6 +723,14 @@ def _num_batches(num_samples: int, batch_size: int) -> int:
     return int(math.ceil(float(num_samples) / float(max(1, batch_size))))
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     *,
@@ -757,6 +782,17 @@ def _run_pair_pass(
         prior=bundle.train_prior,
         device=bundle.train_device,
     )
+    user_dropout_prob = float(getattr(args, "user_dropout_prob", 0.0))
+    if not 0.0 <= user_dropout_prob <= 1.0:
+        raise ValueError(f"--user-dropout-prob must be in [0, 1], got {user_dropout_prob}")
+    user_dropout_fraction = 0.0
+    if backward and user_dropout_prob > 0.0:
+        drop_shape = (int(user_emb.shape[0]),)
+        drop_mask = torch.rand(drop_shape, device=user_emb.device) < user_dropout_prob
+        if bool(drop_mask.any().item()):
+            user_emb = user_emb.clone()
+            user_emb[drop_mask] = 0
+        user_dropout_fraction = float(drop_mask.float().mean().detach().cpu().item())
     noisy_pref, noisy_dispref, pref_noise, dispref_noise, timesteps = _make_noisy_pair(
         scheduler=scheduler,
         preferred=preferred,
@@ -832,6 +868,7 @@ def _run_pair_pass(
         "loss": float(loss_bundle.loss.detach().cpu().item()),
         "total_loss": float(total_loss.detach().cpu().item()),
         "user_residual_l2_penalty": float(residual_l2_penalty.detach().cpu().item()),
+        "user_dropout_fraction": user_dropout_fraction,
         "user_residual_norm": float(sum(residual_norms) / len(residual_norms)) if residual_norms else 0.0,
         "user_base_norm": float(sum(base_norms) / len(base_norms)) if base_norms else 0.0,
         "user_residual_ratio": float(sum(residual_ratios) / len(residual_ratios)) if residual_ratios else 0.0,
@@ -856,6 +893,7 @@ def _mean_metrics(metrics: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
         "loss",
         "total_loss",
         "user_residual_l2_penalty",
+        "user_dropout_fraction",
         "user_residual_norm",
         "user_base_norm",
         "user_residual_ratio",
@@ -901,6 +939,46 @@ def _load_trainable_state(model: nn.Module, state: Mapping[str, Tensor]) -> None
             current[name].copy_(state[name].to(device=current[name].device, dtype=current[name].dtype))
 
 
+def _collect_user_scale_summary(model: nn.Module) -> Dict[str, Any]:
+    values: List[Dict[str, Any]] = []
+    seen_names = set()
+    for name, param in model.named_parameters():
+        if name.endswith(".user_scale") or name == "user_scale":
+            detached = param.detach().float().cpu()
+            scalar = float(detached.reshape(-1)[0].item()) if detached.numel() > 0 else 0.0
+            values.append({"name": name, "value": scalar, "trainable": bool(param.requires_grad)})
+            seen_names.add(name)
+    for name, buffer in model.named_buffers():
+        if name in seen_names:
+            continue
+        if name.endswith(".user_scale") or name == "user_scale":
+            detached = buffer.detach().float().cpu()
+            scalar = float(detached.reshape(-1)[0].item()) if detached.numel() > 0 else 0.0
+            values.append({"name": name, "value": scalar, "trainable": False})
+
+    scalars = [float(item["value"]) for item in values]
+    if scalars:
+        mean = float(sum(scalars) / len(scalars))
+        variance = float(sum((value - mean) ** 2 for value in scalars) / len(scalars))
+        min_value: Optional[float] = float(min(scalars))
+        max_value: Optional[float] = float(max(scalars))
+        std_value: Optional[float] = float(variance**0.5)
+    else:
+        mean = 0.0
+        min_value = None
+        max_value = None
+        std_value = None
+
+    return {
+        "count": len(values),
+        "mean": mean,
+        "min": min_value,
+        "max": max_value,
+        "std": std_value,
+        "values": values,
+    }
+
+
 def _rng_state() -> Dict[str, Any]:
     return {
         "python": random.getstate(),
@@ -930,6 +1008,8 @@ def _critical_config(args: argparse.Namespace) -> Dict[str, Any]:
         "model_id": args.model_id,
         "patch_path": _jsonable(args.patch_path),
         "user_scale": float(args.user_scale),
+        "trainable_user_scale": bool(getattr(args, "trainable_user_scale", True)),
+        "user_dropout_prob": float(getattr(args, "user_dropout_prob", 0.1)),
         "user_projection_bias": bool(getattr(args, "user_projection_bias", True)),
         "user_projection_norm_affine": bool(getattr(args, "user_projection_norm_affine", True)),
         "user_adapter_projection_bias": bool(getattr(args, "user_adapter_projection_bias", True)),
@@ -950,6 +1030,8 @@ def _check_resume_compatibility(checkpoint: Mapping[str, Any], args: argparse.Na
         "user_projection_norm_affine": True,
         "user_adapter_projection_bias": True,
         "user_adapter_zero_init_out": False,
+        "trainable_user_scale": True,
+        "user_dropout_prob": 0.1,
     }
     for key, value in legacy_defaults.items():
         found.setdefault(key, value)
@@ -979,6 +1061,7 @@ def _save_checkpoint(
 ) -> str:
     payload = {
         "trainable_state": _collect_trainable_state(bundle.train_prior),
+        "user_scale_summary": _collect_user_scale_summary(bundle.train_prior),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "micro_step": int(state.micro_step),
@@ -1080,6 +1163,7 @@ def _train_metrics_row(
     bundle: ModelBundle,
 ) -> Dict[str, Any]:
     allocated_mb, reserved_mb = _cuda_memory_mb(bundle.train_device)
+    user_scale_summary = _collect_user_scale_summary(bundle.train_prior)
     return {
         "micro_step": state.micro_step,
         "optimizer_step": state.optimizer_step,
@@ -1089,10 +1173,17 @@ def _train_metrics_row(
         "loss": averaged["loss"],
         "total_loss": averaged["total_loss"],
         "user_residual_l2_penalty": averaged["user_residual_l2_penalty"],
+        "user_dropout_fraction": averaged["user_dropout_fraction"],
         "user_residual_norm": averaged["user_residual_norm"],
         "user_base_norm": averaged["user_base_norm"],
         "user_residual_ratio": averaged["user_residual_ratio"],
         "user_residual_ratio_max": averaged["user_residual_ratio_max"],
+        "user_scale_count": user_scale_summary["count"],
+        "user_scale_mean": user_scale_summary["mean"],
+        "user_scale_min": user_scale_summary["min"],
+        "user_scale_max": user_scale_summary["max"],
+        "user_scale_std": user_scale_summary["std"],
+        "user_scale_values": user_scale_summary["values"],
         "score_mean": averaged["score_mean"],
         "train_pref_err_mean": averaged["train_pref_err_mean"],
         "ref_pref_err_mean": averaged["ref_pref_err_mean"],
@@ -1181,6 +1272,7 @@ def _initial_summary(
         "max_cuda_mem_reserved_mb": 0.0,
         "final_loss": None,
         "best_val_loss": None,
+        "user_scale_summary": None,
         "parameter_delta_status": "not_checked",
         "parameter_delta_max_abs": 0.0,
         "failure_message": None,
@@ -1275,6 +1367,8 @@ def main() -> int:
             raise ValueError("--keep-last-checkpoints must be >= 0.")
         if float(args.user_residual_l2_weight) < 0:
             raise ValueError("--user-residual-l2-weight must be >= 0.")
+        if not 0.0 <= float(args.user_dropout_prob) <= 1.0:
+            raise ValueError("--user-dropout-prob must be in [0, 1].")
 
         train_device = _resolve_device(args.device)
         _set_seed(args.seed, train_device)
@@ -1360,6 +1454,7 @@ def main() -> int:
         frozen_check_every = int(args.frozen_check_every or 0)
         consecutive_data_errors = 0
         latest_train_metrics: Optional[Dict[str, Any]] = None
+        train_start_time = time.time()
 
         while state.micro_step < total_micro_steps:
             epoch = state.micro_step // train_batches_per_epoch
@@ -1421,6 +1516,21 @@ def main() -> int:
                     accumulation_count=accumulation_count,
                     bundle=bundle,
                 )
+                elapsed_sec = max(time.time() - train_start_time, 1e-9)
+                optimizer_steps_per_sec = float(state.optimizer_step) / elapsed_sec
+                micro_steps_per_sec = float(state.micro_step) / elapsed_sec
+                samples_per_sec = float(state.samples_seen) / elapsed_sec
+                remaining_optimizer_steps = max(total_optimizer_steps - state.optimizer_step, 0)
+                eta_sec = (
+                    float(remaining_optimizer_steps) / optimizer_steps_per_sec
+                    if optimizer_steps_per_sec > 0
+                    else float("inf")
+                )
+                train_metrics["elapsed_sec"] = elapsed_sec
+                train_metrics["eta_sec"] = eta_sec if math.isfinite(eta_sec) else None
+                train_metrics["optimizer_steps_per_sec"] = optimizer_steps_per_sec
+                train_metrics["micro_steps_per_sec"] = micro_steps_per_sec
+                train_metrics["samples_per_sec"] = samples_per_sec
                 _append_jsonl(metrics_train_path, train_metrics)
                 latest_train_metrics = train_metrics
                 state.final_loss = float(train_metrics["loss"])
@@ -1439,7 +1549,11 @@ def main() -> int:
                         f"epoch={epoch + 1}/{args.num_epochs} "
                         f"loss={train_metrics['loss']:.6f} "
                         f"grad_norm={train_metrics['grad_norm_pre_clip']:.6f} "
-                        f"cuda_reserved_mb={train_metrics['cuda_reserved_mb']:.2f}"
+                        f"cuda_reserved_mb={train_metrics['cuda_reserved_mb']:.2f} "
+                        f"elapsed={_format_duration(elapsed_sec)} "
+                        f"eta={_format_duration(eta_sec) if math.isfinite(eta_sec) else 'inf'} "
+                        f"steps/s={optimizer_steps_per_sec:.4f} "
+                        f"samples/s={samples_per_sec:.4f}"
                     )
 
                 if (
@@ -1514,6 +1628,7 @@ def main() -> int:
                         )
                     _wandb_log_val(wandb_run, val_metrics, state)
 
+                summary["user_scale_summary"] = _collect_user_scale_summary(bundle.train_prior)
                 _update_summary_from_state(summary, state)
                 _write_json(summary_path, summary)
                 if should_log_status:
@@ -1539,6 +1654,7 @@ def main() -> int:
         summary["parameter_delta_max_abs"] = max_delta
         if not changed:
             summary["failure_message"] = "Trainable user-conditioning parameter slices did not change."
+            summary["user_scale_summary"] = _collect_user_scale_summary(bundle.train_prior)
             _update_summary_from_state(summary, state)
             _write_json(summary_path, summary)
             _finish_wandb(wandb_run, status="failed", summary=summary)
@@ -1546,6 +1662,7 @@ def main() -> int:
 
         summary["run_status"] = "success"
         summary["failure_message"] = None
+        summary["user_scale_summary"] = _collect_user_scale_summary(bundle.train_prior)
         _update_summary_from_state(summary, state)
         if latest_train_metrics is not None:
             summary["last_train_metrics"] = latest_train_metrics
@@ -1556,6 +1673,7 @@ def main() -> int:
         print("[train_stage2_full] metrics train:", metrics_train_path)
         print("[train_stage2_full] summary:", summary_path)
         print("[train_stage2_full] checkpoint latest:", run_dir / "checkpoint_latest.pt")
+        print("[train_stage2_full] user_scale summary:", summary["user_scale_summary"])
         _finish_wandb(wandb_run, status="success", summary=summary)
         return 0
     except Exception as exc:

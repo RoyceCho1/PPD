@@ -200,6 +200,52 @@ class UserCrossAttentionAdapter(nn.Module):
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz_q, n_q, self.d_model)
         return self.out_proj(attn_out)
 
+    def forward_with_projected_query(
+        self,
+        projected_query: Tensor,
+        user_tokens: Tensor,
+        user_attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Run user cross-attention with a query already projected by the base attention."""
+
+        if projected_query.ndim != 3:
+            raise ValueError(
+                f"projected_query must have shape [B, N_q, {self.d_model}], got ndim={projected_query.ndim}"
+            )
+        if user_tokens.ndim != 3:
+            raise ValueError(
+                f"user_tokens must have shape [B, L, {self.d_cross}], got ndim={user_tokens.ndim}"
+            )
+
+        bsz_q, n_q, d_q = projected_query.shape
+        bsz_u, l_u, d_u = user_tokens.shape
+        if d_q != self.d_model:
+            raise ValueError(f"projected_query last dim must be {self.d_model}, got {d_q}")
+        if d_u != self.d_cross:
+            raise ValueError(f"user_tokens last dim must be {self.d_cross}, got {d_u}")
+        if bsz_q != bsz_u:
+            raise ValueError(
+                f"Batch size mismatch between projected_query ({bsz_q}) and user_tokens ({bsz_u})"
+            )
+
+        u_in = self.user_norm(user_tokens)
+        q = self._reshape_heads(projected_query)
+        k = self._reshape_heads(self.k_proj(u_in))
+        v = self._reshape_heads(self.v_proj(u_in))
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if user_attention_mask is not None:
+            mask = self._validate_mask(user_attention_mask.to(device=attn_scores.device), bsz_q, l_u)
+            attn_mask = mask[:, None, None, :]
+            attn_probs = self._masked_softmax(attn_scores, attn_mask)
+        else:
+            attn_probs = torch.softmax(attn_scores, dim=-1)
+
+        attn_probs = self.attn_dropout(attn_probs)
+        attn_out = torch.matmul(attn_probs, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz_q, n_q, self.d_model)
+        return self.out_proj(attn_out)
+
 
 if __name__ == "__main__":
     torch.manual_seed(42)

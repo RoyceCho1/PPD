@@ -1470,11 +1470,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Run each prompt/seed across multiple inference-only user scale values.",
     )
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--prior-steps", type=int, default=20)
     parser.add_argument("--prior-guidance-scale", type=float, default=4.0)
-    parser.add_argument("--decoder-steps", type=int, default=10)
+    parser.add_argument("--decoder-steps", type=int, default=20)
     parser.add_argument("--decoder-preflight-steps", type=int, default=1)
     parser.add_argument("--decoder-guidance-scale", type=float, default=0.0)
     parser.add_argument("--negative-prompt", type=str, default=None)

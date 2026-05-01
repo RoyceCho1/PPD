@@ -163,6 +163,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Patch path; may be repeated or comma-separated. Defaults to Stage 1 patch paths.",
     )
     parser.add_argument("--user-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--trainable-user-scale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train user_scale in patched user-conditioning blocks (default: True).",
+    )
     parser.add_argument("--dpo-beta", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -242,6 +248,7 @@ def _load_and_prepare_models(args: argparse.Namespace, pipe: Any, train_device: 
         max_blocks=None,
         user_emb_dim=3584,
         user_scale=args.user_scale,
+        trainable_user_scale=bool(getattr(args, "trainable_user_scale", True)),
         user_projection_bias=bool(getattr(args, "user_projection_bias", True)),
         user_projection_norm_affine=bool(getattr(args, "user_projection_norm_affine", True)),
         user_adapter_projection_bias=bool(getattr(args, "user_adapter_projection_bias", True)),

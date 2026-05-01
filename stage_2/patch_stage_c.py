@@ -128,26 +128,27 @@ class PatchedSDCascadeAttnBlock(nn.Module):
     ) -> Tensor:
         """Run the original block and optionally add user-conditioning residual."""
 
+        projected_query = self.project_original_attention_query(x) if user_emb is not None else None
         base_out = self._run_base_block(x=x, kv=kv, kwargs=kwargs) # original block output(x kv cross-attention)
         if user_emb is None:
             return base_out
 
-        query, restore = self._to_token_sequence(base_out) # base_out을 token sequence로 변환
-        self._sync_user_modules(reference=query) # user branch를 query tensor의 device와 dtype으로 동기화
+        _, restore = self._to_token_sequence(base_out) # base_out과 같은 shape으로 residual 복원
+        self._sync_user_modules(reference=projected_query) # user branch를 query tensor의 device와 dtype으로 동기화
 
-        user_emb = user_emb.to(device=query.device, dtype=query.dtype)
+        user_emb = user_emb.to(device=projected_query.device, dtype=projected_query.dtype)
         if user_emb_attention_mask is not None:
-            user_emb_attention_mask = user_emb_attention_mask.to(device=query.device)
+            user_emb_attention_mask = user_emb_attention_mask.to(device=projected_query.device)
 
         user_tokens = self.user_projection(
             user_emb=user_emb,
             user_emb_attention_mask=user_emb_attention_mask,
         ) # user embedding을 cross-attention token space로 projection
-        user_residual = self.user_adapter(
-            query=query,
+        user_residual = self.user_adapter.forward_with_projected_query(
+            projected_query=projected_query,
             user_tokens=user_tokens,
             user_attention_mask=user_emb_attention_mask,
-        ) # user embedding을 cross-attention으로 주입
+        ) # original text attention의 projected Q를 공유해서 user embedding을 주입
         user_residual = restore(user_residual) # user residual을 base_out과 같은 shape으로 복원
         return base_out + self.user_scale.to(device=base_out.device, dtype=base_out.dtype) * user_residual
 
@@ -171,6 +172,38 @@ class PatchedSDCascadeAttnBlock(nn.Module):
         dtype = reference.dtype if reference.is_floating_point() else torch.float32
         self.user_projection.to(device=reference.device, dtype=dtype)
         self.user_adapter.to(device=reference.device, dtype=dtype)
+
+    def project_original_attention_query(self, x: Tensor) -> Tensor:
+        """Return the projected Q used by the wrapped text-conditioning attention."""
+
+        norm = getattr(self.base_block, "norm", None)
+        attention = getattr(self.base_block, "attention", None)
+        if norm is None or attention is None or not hasattr(attention, "to_q"):
+            raise RuntimeError("Wrapped attention block does not expose norm/attention.to_q for shared-Q user attention.")
+
+        hidden_states = norm(x)
+        if hidden_states.ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        elif hidden_states.ndim == 3:
+            pass
+        else:
+            raise ValueError(
+                "Original attention query source must have ndim 3 or 4, "
+                f"got shape={tuple(hidden_states.shape)}"
+            )
+
+        group_norm = getattr(attention, "group_norm", None)
+        if group_norm is not None:
+            hidden_states = group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        projected_query = attention.to_q(hidden_states)
+        if projected_query.ndim != 3 or projected_query.shape[-1] != self.d_model:
+            raise ValueError(
+                "Original attention projected query shape mismatch: "
+                f"expected last dim {self.d_model}, got {tuple(projected_query.shape)}"
+            )
+        return projected_query
 
     def _to_token_sequence(self, hidden: Tensor) -> Tuple[Tensor, Any]:
         """Flatten supported hidden-state layouts to [B, N, D]."""
