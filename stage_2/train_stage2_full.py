@@ -33,9 +33,11 @@ try:
         ParamSliceSnapshot,
         _append_jsonl,
         _capture_param_slices,
+        _cuda_memory_by_device,
         _compute_loss_from_errors,
-        _cuda_memory_mb,
+        _empty_cache_for_bundle_devices,
         _effective_prior_dtype,
+        _max_reserved_memory_value,
         _encode_text_for_devices,
         _full_frozen_integrity_check,
         _grad_stats,
@@ -78,9 +80,11 @@ except ImportError:  # pragma: no cover - useful when imported as package module
         ParamSliceSnapshot,
         _append_jsonl,
         _capture_param_slices,
+        _cuda_memory_by_device,
         _compute_loss_from_errors,
-        _cuda_memory_mb,
+        _empty_cache_for_bundle_devices,
         _effective_prior_dtype,
+        _max_reserved_memory_value,
         _encode_text_for_devices,
         _full_frozen_integrity_check,
         _grad_stats,
@@ -142,6 +146,8 @@ class TrainState:
     final_loss: Optional[float] = None
     max_grad_norm_observed: float = 0.0
     max_cuda_mem_reserved_mb: float = 0.0
+    max_train_cuda_mem_reserved_mb: float = 0.0
+    max_reference_cuda_mem_reserved_mb: float = 0.0
     nan_failures: int = 0
     frozen_integrity_failures: int = 0
     data_errors: int = 0
@@ -357,12 +363,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--torch-dtype", type=str, default="auto", choices=("auto", "float16", "bfloat16", "float32"))
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--reference-device", type=str, default="cuda", choices=("cuda", "cpu"))
+    parser.add_argument(
+        "--reference-device",
+        type=str,
+        default="cuda",
+        help=(
+            "Device for the frozen reference prior. `cuda` follows the train device for compatibility; "
+            "use an explicit device such as `cuda:1` to split models across GPUs."
+        ),
+    )
     parser.add_argument(
         "--patch-path",
         action="append",
         default=None,
         help="Patch path; may be repeated or comma-separated. Defaults to Stage 1 patch paths.",
+    )
+    parser.add_argument(
+        "--patch-all-attention-blocks",
+        dest="patch_path",
+        action="append_const",
+        const="__all__",
+        help="Patch every detected Stable Cascade attention block.",
     )
     parser.add_argument("--user-scale", type=float, default=1.0)
     parser.add_argument(
@@ -402,6 +423,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Zero-initialize user adapter out_proj for new runs (default: False for checkpoint compatibility).",
     )
+    parser.add_argument(
+        "--train-user-adapter-out-proj",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train user adapter out_proj parameters (default: True).",
+    )
     parser.add_argument("--dpo-beta", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -413,8 +440,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-on-nan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--latest-checkpoint-every-steps", type=int, default=1000)
-    parser.add_argument("--checkpoint-every-steps", type=int, default=10000)
-    parser.add_argument("--keep-last-checkpoints", type=int, default=3)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=1000)
+    parser.add_argument("--keep-last-checkpoints", type=int, default=99999)
     parser.add_argument("--val-every-steps", type=int, default=100)
     parser.add_argument("--max-val-batches", type=int, default=20)
     parser.add_argument("--max-consecutive-data-errors", type=int, default=0)
@@ -525,6 +552,10 @@ def _wandb_log_train(wandb_run: Any, train_metrics: Mapping[str, Any], state: Tr
         "train/grad_norm_post_clip": train_metrics["grad_norm_post_clip"],
         "train/lr": train_metrics["lr"],
         "train/cuda_reserved_mb": train_metrics["cuda_reserved_mb"],
+        "train/device": train_metrics["train_device"],
+        "train/reference_device": train_metrics["reference_device"],
+        "train/train_cuda_reserved_mb": train_metrics["train_cuda_reserved_mb"],
+        "train/reference_cuda_reserved_mb": train_metrics["reference_cuda_reserved_mb"],
         "checkpoint/latest_path": state.latest_checkpoint_path,
         "checkpoint/best_path": state.best_checkpoint_path,
         "checkpoint/num_archive_kept": state.num_archive_checkpoints_kept,
@@ -548,6 +579,10 @@ def _wandb_log_val(wandb_run: Any, val_metrics: Mapping[str, Any], state: TrainS
         "val/train_dispref_err": val_metrics["val_train_dispref_err_mean"],
         "val/ref_dispref_err": val_metrics["val_ref_dispref_err_mean"],
         "val/batches": val_metrics["val_batches"],
+        "val/train_device": val_metrics["train_device"],
+        "val/reference_device": val_metrics["reference_device"],
+        "val/train_cuda_reserved_mb": val_metrics["train_cuda_reserved_mb"],
+        "val/reference_cuda_reserved_mb": val_metrics["reference_cuda_reserved_mb"],
         "checkpoint/latest_path": state.latest_checkpoint_path,
         "checkpoint/best_path": state.best_checkpoint_path,
         "checkpoint/num_archive_kept": state.num_archive_checkpoints_kept,
@@ -568,6 +603,10 @@ def _finish_wandb(wandb_run: Any, *, status: str, summary: Mapping[str, Any]) ->
         "num_micro_steps_completed": summary.get("num_micro_steps_completed"),
         "num_optimizer_steps_completed": summary.get("num_optimizer_steps_completed"),
         "samples_seen": summary.get("samples_seen"),
+        "train_device": summary.get("train_device"),
+        "reference_device": summary.get("reference_device"),
+        "max_train_cuda_mem_reserved_mb": summary.get("max_train_cuda_mem_reserved_mb"),
+        "max_reference_cuda_mem_reserved_mb": summary.get("max_reference_cuda_mem_reserved_mb"),
         "best_val_loss": summary.get("best_val_loss"),
         "final_loss": summary.get("final_loss"),
         "user_scale_mean": user_scale_summary.get("mean"),
@@ -817,8 +856,7 @@ def _run_pair_pass(
         ref_dispref_err = _per_sample_mse(ref_dispref_pred, ref_dispref_noise).detach().to(bundle.train_device)
 
     del ref_pref_pred, ref_dispref_pred
-    if bundle.train_device.type == "cuda":
-        torch.cuda.empty_cache()
+    _empty_cache_for_bundle_devices(bundle)
 
     residual_l2_terms: List[Tensor] = []
     residual_diagnostics: List[Dict[str, Any]] = []
@@ -1003,6 +1041,14 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
 
 
 def _critical_config(args: argparse.Namespace) -> Dict[str, Any]:
+    trainable_markers = [
+        ".user_projection.",
+        ".user_adapter.k_proj.",
+        ".user_adapter.v_proj.",
+    ]
+    if bool(getattr(args, "train_user_adapter_out_proj", True)):
+        trainable_markers.append(".user_adapter.out_proj.")
+    trainable_markers.append(".user_scale")
     return {
         "schema": DATASET_SCHEMA_VERSION,
         "model_id": args.model_id,
@@ -1014,7 +1060,8 @@ def _critical_config(args: argparse.Namespace) -> Dict[str, Any]:
         "user_projection_norm_affine": bool(getattr(args, "user_projection_norm_affine", True)),
         "user_adapter_projection_bias": bool(getattr(args, "user_adapter_projection_bias", True)),
         "user_adapter_zero_init_out": bool(getattr(args, "user_adapter_zero_init_out", False)),
-        "trainable_markers": list(USER_CONDITIONING_NAME_MARKERS),
+        "train_user_adapter_out_proj": bool(getattr(args, "train_user_adapter_out_proj", True)),
+        "trainable_markers": trainable_markers,
         "latent_shape": list(EXPECTED_LATENT_SHAPE),
     }
 
@@ -1030,8 +1077,9 @@ def _check_resume_compatibility(checkpoint: Mapping[str, Any], args: argparse.Na
         "user_projection_norm_affine": True,
         "user_adapter_projection_bias": True,
         "user_adapter_zero_init_out": False,
-        "trainable_user_scale": True,
         "user_dropout_prob": 0.1,
+        "trainable_user_scale": True,
+        "train_user_adapter_out_proj": True,
     }
     for key, value in legacy_defaults.items():
         found.setdefault(key, value)
@@ -1162,7 +1210,7 @@ def _train_metrics_row(
     accumulation_count: int,
     bundle: ModelBundle,
 ) -> Dict[str, Any]:
-    allocated_mb, reserved_mb = _cuda_memory_mb(bundle.train_device)
+    memory_metrics = _cuda_memory_by_device(bundle)
     user_scale_summary = _collect_user_scale_summary(bundle.train_prior)
     return {
         "micro_step": state.micro_step,
@@ -1199,8 +1247,9 @@ def _train_metrics_row(
         "tensors_with_nonzero_grad": post_clip.tensors_with_nonzero_grad,
         "lr": float(optimizer.param_groups[0]["lr"]),
         "step_time_sec": averaged["step_time_sec"],
-        "cuda_allocated_mb": allocated_mb,
-        "cuda_reserved_mb": reserved_mb,
+        "cuda_allocated_mb": memory_metrics["train_cuda_allocated_mb"],
+        "cuda_reserved_mb": memory_metrics["train_cuda_reserved_mb"],
+        **memory_metrics,
     }
 
 
@@ -1240,6 +1289,7 @@ def _run_validation(
     if not rows:
         raise RuntimeError("Validation produced zero batches.")
     averaged = _mean_metrics(rows)
+    memory_metrics = _cuda_memory_by_device(bundle)
     return {
         "trigger_optimizer_step": trigger_optimizer_step,
         "val_batches": len(rows),
@@ -1250,6 +1300,7 @@ def _run_validation(
         "val_train_dispref_err_mean": averaged["train_dispref_err_mean"],
         "val_ref_dispref_err_mean": averaged["ref_dispref_err_mean"],
         "val_step_time_sec": averaged["step_time_sec"],
+        **memory_metrics,
     }
 
 
@@ -1270,6 +1321,10 @@ def _initial_summary(
         "data_errors": 0,
         "max_grad_norm_observed": 0.0,
         "max_cuda_mem_reserved_mb": 0.0,
+        "max_train_cuda_mem_reserved_mb": 0.0,
+        "max_reference_cuda_mem_reserved_mb": 0.0,
+        "train_device": None,
+        "reference_device": None,
         "final_loss": None,
         "best_val_loss": None,
         "user_scale_summary": None,
@@ -1304,6 +1359,8 @@ def _update_summary_from_state(summary: Dict[str, Any], state: TrainState) -> No
     summary["data_errors"] = state.data_errors
     summary["max_grad_norm_observed"] = state.max_grad_norm_observed
     summary["max_cuda_mem_reserved_mb"] = state.max_cuda_mem_reserved_mb
+    summary["max_train_cuda_mem_reserved_mb"] = state.max_train_cuda_mem_reserved_mb
+    summary["max_reference_cuda_mem_reserved_mb"] = state.max_reference_cuda_mem_reserved_mb
     summary["latest_checkpoint_path"] = state.latest_checkpoint_path
     summary["best_checkpoint_path"] = state.best_checkpoint_path
     summary["num_archive_checkpoints_kept"] = state.num_archive_checkpoints_kept
@@ -1404,6 +1461,9 @@ def main() -> int:
 
         pipe = _load_prior_pipeline(args)
         bundle = _load_and_prepare_models(args=args, pipe=pipe, train_device=train_device)
+        summary["train_device"] = str(bundle.train_device)
+        summary["reference_device"] = str(bundle.reference_device)
+        _write_json(summary_path, summary)
         scheduler = getattr(pipe, "scheduler", None)
         if scheduler is None or not hasattr(scheduler, "add_noise"):
             raise ValueError("Pipeline scheduler must expose add_noise(original_samples, noise, timesteps).")
@@ -1476,8 +1536,7 @@ def main() -> int:
                     consecutive_data_errors = 0
                 except Exception as exc:
                     if _is_oom_error(exc):
-                        if train_device.type == "cuda":
-                            torch.cuda.empty_cache()
+                        _empty_cache_for_bundle_devices(bundle)
                         _print_memory_hint(exc)
                     consecutive_data_errors += 1
                     state.data_errors += 1
@@ -1535,7 +1594,18 @@ def main() -> int:
                 latest_train_metrics = train_metrics
                 state.final_loss = float(train_metrics["loss"])
                 state.max_grad_norm_observed = max(state.max_grad_norm_observed, float(train_metrics["grad_norm_pre_clip"]))
-                state.max_cuda_mem_reserved_mb = max(state.max_cuda_mem_reserved_mb, float(train_metrics["cuda_reserved_mb"]))
+                state.max_cuda_mem_reserved_mb = max(
+                    state.max_cuda_mem_reserved_mb,
+                    _max_reserved_memory_value(train_metrics),
+                )
+                state.max_train_cuda_mem_reserved_mb = max(
+                    state.max_train_cuda_mem_reserved_mb,
+                    float(train_metrics["train_cuda_reserved_mb"]),
+                )
+                state.max_reference_cuda_mem_reserved_mb = max(
+                    state.max_reference_cuda_mem_reserved_mb,
+                    float(train_metrics["reference_cuda_reserved_mb"]),
+                )
 
                 if frozen_check_every > 0 and state.optimizer_step % frozen_check_every == 0:
                     _full_frozen_integrity_check(bundle, optimizer=optimizer)
@@ -1549,7 +1619,8 @@ def main() -> int:
                         f"epoch={epoch + 1}/{args.num_epochs} "
                         f"loss={train_metrics['loss']:.6f} "
                         f"grad_norm={train_metrics['grad_norm_pre_clip']:.6f} "
-                        f"cuda_reserved_mb={train_metrics['cuda_reserved_mb']:.2f} "
+                        f"train_cuda_reserved_mb={train_metrics['train_cuda_reserved_mb']:.2f} "
+                        f"reference_cuda_reserved_mb={train_metrics['reference_cuda_reserved_mb']:.2f} "
                         f"elapsed={_format_duration(elapsed_sec)} "
                         f"eta={_format_duration(eta_sec) if math.isfinite(eta_sec) else 'inf'} "
                         f"steps/s={optimizer_steps_per_sec:.4f} "

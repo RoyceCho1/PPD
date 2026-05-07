@@ -379,10 +379,13 @@ def _normalize_patch_paths_for_compare(raw: Any) -> List[str]:
     if raw is None:
         return list(_parse_patch_paths(None))
     if isinstance(raw, str):
-        return list(_parse_patch_paths([raw]))
+        parsed = _parse_patch_paths([raw])
+        return ["__all__"] if parsed is None else list(parsed)
     if isinstance(raw, Sequence):
-        return list(_parse_patch_paths([str(item) for item in raw]))
-    return list(_parse_patch_paths([str(raw)]))
+        parsed = _parse_patch_paths([str(item) for item in raw])
+        return ["__all__"] if parsed is None else list(parsed)
+    parsed = _parse_patch_paths([str(raw)])
+    return ["__all__"] if parsed is None else list(parsed)
 
 
 def _compare_patch_path(found: Any, requested_raw: Optional[Sequence[str]]) -> bool:
@@ -420,11 +423,8 @@ def _validate_checkpoint_metadata(
         raise RuntimeError(f"patch_path mismatch: checkpoint={critical.get('patch_path')}, requested={args.patch_path}")
 
     found_markers = list(critical.get("trainable_markers", []))
-    if found_markers != list(USER_CONDITIONING_NAME_MARKERS):
-        raise RuntimeError(
-            "trainable marker mismatch: "
-            f"checkpoint={found_markers}, expected={list(USER_CONDITIONING_NAME_MARKERS)}"
-        )
+    if not found_markers:
+        found_markers = list(USER_CONDITIONING_NAME_MARKERS)
 
     unexpected_trainable = [name for name in current_trainable_names if not _is_user_conditioning_param(name)]
     if unexpected_trainable:
@@ -445,7 +445,7 @@ def _validate_checkpoint_metadata(
     return {
         "checkpoint_critical_config": dict(critical),
         "trainable_state_tensors": len(state_names),
-        "trainable_scope_mode": "user_projection+k_proj+v_proj+out_proj+user_scale",
+        "trainable_scope_mode": "+".join(found_markers),
         "user_branch_structure_keys": sorted(state_names),
         "compatibility_warnings": warnings,
         "inference_config_version": INFERENCE_CONFIG_VERSION,
@@ -500,6 +500,13 @@ def _sync_text_encoder_dtype(pipe: Any, device: torch.device) -> None:
 
 def _prepare_prior_pipeline(args: argparse.Namespace, device: torch.device) -> Tuple[Any, Dict[str, Any]]:
     checkpoint = _torch_load(args.checkpoint_path, map_location="cpu")
+    critical = checkpoint.get("critical_config", {})
+    trainable_user_scale = True
+    if isinstance(critical, Mapping) and "trainable_user_scale" in critical:
+        trainable_user_scale = bool(critical["trainable_user_scale"])
+    train_user_adapter_out_proj = True
+    if isinstance(critical, Mapping) and "train_user_adapter_out_proj" in critical:
+        train_user_adapter_out_proj = bool(critical["train_user_adapter_out_proj"])
     pipe = _load_pipeline("StableCascadePriorPipeline", args.prior_model_id, args, device)
     prior = pipe.prior
     patch_paths = _parse_patch_paths(args.patch_path)
@@ -509,12 +516,16 @@ def _prepare_prior_pipeline(args: argparse.Namespace, device: torch.device) -> T
         max_blocks=None,
         user_emb_dim=EXPECTED_USER_EMB_DIM,
         user_scale=float(args.user_scale),
+        trainable_user_scale=trainable_user_scale,
         user_projection_bias=bool(getattr(args, "user_projection_bias", True)),
         user_projection_norm_affine=bool(getattr(args, "user_projection_norm_affine", True)),
         user_adapter_projection_bias=bool(getattr(args, "user_adapter_projection_bias", True)),
         user_adapter_zero_init_out=bool(getattr(args, "user_adapter_zero_init_out", False)),
     )
-    freeze_stage_c_except_user_modules(prior)
+    freeze_stage_c_except_user_modules(
+        prior,
+        train_user_adapter_out_proj=train_user_adapter_out_proj,
+    )
     trainable_summary = summarize_trainable_parameters(prior, max_names=40)
     current_trainable_names = [name for name, param in prior.named_parameters() if param.requires_grad]
     compatibility = _validate_checkpoint_metadata(checkpoint, args, current_trainable_names)
@@ -1447,6 +1458,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--torch-dtype", type=str, default="auto", choices=("auto", "float16", "bfloat16", "float32"))
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--patch-path", action="append", default=None)
+    parser.add_argument(
+        "--patch-all-attention-blocks",
+        dest="patch_path",
+        action="append_const",
+        const="__all__",
+        help="Patch every detected Stable Cascade attention block.",
+    )
     parser.add_argument(
         "--vanilla-prior",
         action="store_true",

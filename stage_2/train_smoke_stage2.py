@@ -155,12 +155,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--torch-dtype", type=str, default="auto", choices=("auto", "float16", "bfloat16", "float32"))
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--reference-device", type=str, default="cuda", choices=("cuda", "cpu"))
+    parser.add_argument(
+        "--reference-device",
+        type=str,
+        default="cuda",
+        help=(
+            "Device for the frozen reference prior. `cuda` follows the train device for compatibility; "
+            "use an explicit device such as `cuda:1` to split models across GPUs."
+        ),
+    )
     parser.add_argument(
         "--patch-path",
         action="append",
         default=None,
         help="Patch path; may be repeated or comma-separated. Defaults to Stage 1 patch paths.",
+    )
+    parser.add_argument(
+        "--patch-all-attention-blocks",
+        dest="patch_path",
+        action="append_const",
+        const="__all__",
+        help="Patch every detected Stable Cascade attention block.",
     )
     parser.add_argument("--user-scale", type=float, default=1.0)
     parser.add_argument(
@@ -168,6 +183,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Train user_scale in patched user-conditioning blocks (default: True).",
+    )
+    parser.add_argument(
+        "--train-user-adapter-out-proj",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train user adapter out_proj parameters (default: True).",
     )
     parser.add_argument("--dpo-beta", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -216,11 +237,28 @@ def _make_run_dir(output_root: Path) -> Path:
 
 
 def _resolve_reference_device(raw: str, train_device: torch.device) -> torch.device:
-    if raw == "cpu":
+    value = str(raw).strip().lower()
+    if value == "cpu":
         return torch.device("cpu")
-    if train_device.type == "cuda":
-        return train_device
-    return torch.device("cpu")
+    if value == "cuda":
+        return train_device if train_device.type == "cuda" else torch.device("cpu")
+
+    try:
+        device = torch.device(value)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid --reference-device={raw!r}; expected `cpu`, `cuda`, or explicit CUDA device like `cuda:1`."
+        ) from exc
+
+    if device.type == "cpu":
+        return device
+    if device.type == "cuda":
+        if device.index is None:
+            return train_device if train_device.type == "cuda" else torch.device("cpu")
+        return device
+    raise ValueError(
+        f"Invalid --reference-device={raw!r}; expected `cpu`, `cuda`, or explicit CUDA device like `cuda:1`."
+    )
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -233,6 +271,39 @@ def _cuda_memory_mb(device: torch.device) -> Tuple[float, float]:
     return (
         float(torch.cuda.max_memory_allocated(device) / (1024 * 1024)),
         float(torch.cuda.max_memory_reserved(device) / (1024 * 1024)),
+    )
+
+
+def _cuda_memory_by_device(bundle: ModelBundle) -> Dict[str, Any]:
+    train_allocated_mb, train_reserved_mb = _cuda_memory_mb(bundle.train_device)
+    reference_allocated_mb, reference_reserved_mb = _cuda_memory_mb(bundle.reference_device)
+    return {
+        "train_device": str(bundle.train_device),
+        "reference_device": str(bundle.reference_device),
+        "train_cuda_allocated_mb": train_allocated_mb,
+        "train_cuda_reserved_mb": train_reserved_mb,
+        "reference_cuda_allocated_mb": reference_allocated_mb,
+        "reference_cuda_reserved_mb": reference_reserved_mb,
+    }
+
+
+def _empty_cache_for_bundle_devices(bundle: ModelBundle) -> None:
+    seen: set[Tuple[str, Optional[int]]] = set()
+    for device in (bundle.train_device, bundle.reference_device):
+        if device.type != "cuda":
+            continue
+        key = (device.type, device.index)
+        if key in seen:
+            continue
+        seen.add(key)
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+
+
+def _max_reserved_memory_value(metrics: Mapping[str, Any]) -> float:
+    return max(
+        float(metrics.get("train_cuda_reserved_mb", metrics.get("cuda_max_memory_reserved_mb", 0.0))),
+        float(metrics.get("reference_cuda_reserved_mb", 0.0)),
     )
 
 
@@ -254,7 +325,10 @@ def _load_and_prepare_models(args: argparse.Namespace, pipe: Any, train_device: 
         user_adapter_projection_bias=bool(getattr(args, "user_adapter_projection_bias", True)),
         user_adapter_zero_init_out=bool(getattr(args, "user_adapter_zero_init_out", False)),
     )
-    freeze_stage_c_except_user_modules(train_prior)
+    freeze_stage_c_except_user_modules(
+        train_prior,
+        train_user_adapter_out_proj=bool(getattr(args, "train_user_adapter_out_proj", True)),
+    )
     _validate_trainable_scope(train_prior)
     _validate_reference_frozen(reference_prior)
 
@@ -558,8 +632,7 @@ def _run_step(
         ref_dispref_err = _per_sample_mse(ref_dispref_pred, ref_dispref_noise).detach().to(bundle.train_device)
 
     del ref_pref_pred, ref_dispref_pred
-    if bundle.train_device.type == "cuda":
-        torch.cuda.empty_cache()
+    _empty_cache_for_bundle_devices(bundle)
 
     with user_conditioning_hooks(
         bundle.train_prior,
@@ -596,7 +669,7 @@ def _run_step(
     for name, param in _trainable_named_parameters(bundle.train_prior):
         _require_finite(f"updated_param[{name}]", param)
 
-    allocated_mb, reserved_mb = _cuda_memory_mb(bundle.train_device)
+    memory_metrics = _cuda_memory_by_device(bundle)
     return {
         "step": step,
         "loss": float(loss_bundle.loss.detach().cpu().item()),
@@ -615,8 +688,9 @@ def _run_step(
         "tensors_with_nonzero_grad": post_clip.tensors_with_nonzero_grad,
         "learning_rate": float(optimizer.param_groups[0]["lr"]),
         "step_time_sec": time.time() - step_start,
-        "cuda_max_memory_allocated_mb": allocated_mb,
-        "cuda_max_memory_reserved_mb": reserved_mb,
+        "cuda_max_memory_allocated_mb": memory_metrics["train_cuda_allocated_mb"],
+        "cuda_max_memory_reserved_mb": memory_metrics["train_cuda_reserved_mb"],
+        **memory_metrics,
     }
 
 
@@ -628,6 +702,10 @@ def _initial_summary(args: argparse.Namespace, run_dir: Path) -> Dict[str, Any]:
         "frozen_integrity_failures": 0,
         "max_grad_norm_observed": 0.0,
         "max_cuda_mem_reserved_mb": 0.0,
+        "max_train_cuda_mem_reserved_mb": 0.0,
+        "max_reference_cuda_mem_reserved_mb": 0.0,
+        "train_device": None,
+        "reference_device": None,
         "final_loss": None,
         "parameter_delta_status": "not_checked",
         "parameter_delta_max_abs": 0.0,
@@ -643,7 +721,7 @@ def _initial_summary(args: argparse.Namespace, run_dir: Path) -> Dict[str, Any]:
 def _print_memory_hint(exc: BaseException) -> None:
     print("[train_smoke_stage2] failure:", str(exc))
     print("[train_smoke_stage2] no automatic retry will be attempted.")
-    print("[train_smoke_stage2] if this is memory-related, rerun with --reference-device cpu.")
+    print("[train_smoke_stage2] if this is memory-related, rerun with --reference-device cuda:1 or cpu.")
 
 
 def main() -> int:
@@ -661,6 +739,9 @@ def main() -> int:
         dataset, loader = _build_loader(args)
         pipe = _load_prior_pipeline(args)
         bundle = _load_and_prepare_models(args=args, pipe=pipe, train_device=train_device)
+        summary["train_device"] = str(bundle.train_device)
+        summary["reference_device"] = str(bundle.reference_device)
+        _write_json(summary_path, summary)
         scheduler = getattr(pipe, "scheduler", None)
         if scheduler is None or not hasattr(scheduler, "add_noise"):
             raise ValueError("Pipeline scheduler must expose add_noise(original_samples, noise, timesteps).")
@@ -698,8 +779,7 @@ def main() -> int:
                     _full_frozen_integrity_check(bundle, optimizer=optimizer)
             except Exception as exc:
                 if _is_oom_error(exc):
-                    if train_device.type == "cuda":
-                        torch.cuda.empty_cache()
+                    _empty_cache_for_bundle_devices(bundle)
                     summary["failure_message"] = f"CUDA OOM: {exc}"
                     _print_memory_hint(exc)
                 else:
@@ -724,7 +804,15 @@ def main() -> int:
             )
             summary["max_cuda_mem_reserved_mb"] = max(
                 float(summary["max_cuda_mem_reserved_mb"]),
-                float(metrics["cuda_max_memory_reserved_mb"]),
+                _max_reserved_memory_value(metrics),
+            )
+            summary["max_train_cuda_mem_reserved_mb"] = max(
+                float(summary["max_train_cuda_mem_reserved_mb"]),
+                float(metrics["train_cuda_reserved_mb"]),
+            )
+            summary["max_reference_cuda_mem_reserved_mb"] = max(
+                float(summary["max_reference_cuda_mem_reserved_mb"]),
+                float(metrics["reference_cuda_reserved_mb"]),
             )
             summary["final_loss"] = metrics["loss"]
 
@@ -735,7 +823,8 @@ def main() -> int:
                     f"loss={metrics['loss']:.6f} "
                     f"pre_clip_grad_norm={metrics['pre_clip_grad_norm']:.6f} "
                     f"post_clip_grad_norm={metrics['post_clip_grad_norm']:.6f} "
-                    f"cuda_reserved_mb={metrics['cuda_max_memory_reserved_mb']:.2f}"
+                    f"train_cuda_reserved_mb={metrics['train_cuda_reserved_mb']:.2f} "
+                    f"reference_cuda_reserved_mb={metrics['reference_cuda_reserved_mb']:.2f}"
                 )
 
         changed, max_delta = _param_slice_delta(before, bundle.train_prior)

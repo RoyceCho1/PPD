@@ -10,12 +10,14 @@ to the generated result.
 """
 
 import argparse
+import itertools
 import json
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -47,6 +49,7 @@ DEFAULT_ASSIGNMENT_JSONL_PATH = Path(
 DEFAULT_UID_TO_PATH_JSON_PATH = Path("data/validation_uid_to_path.json")
 DEFAULT_PRIOR_MODEL_ID = "stabilityai/stable-cascade-prior"
 DEFAULT_DECODER_MODEL_ID = "stabilityai/stable-cascade"
+DEFAULT_HF_HOME = Path("/Data_Storage/roycecho/PPD/hf_cache")
 
 
 def _jsonable(value: Any) -> Any:
@@ -106,6 +109,24 @@ def _apply_checkpoint_arg_defaults(args: argparse.Namespace) -> None:
     if args.user_scale is None and critical.get("user_scale") is not None:
         args.user_scale = float(critical["user_scale"])
         print(f"[generate_stage2_user_grid] using checkpoint user_scale={args.user_scale}")
+    if args.patch_path is None and critical.get("patch_path") is not None:
+        patch_path = critical["patch_path"]
+        if isinstance(patch_path, str):
+            args.patch_path = [patch_path]
+        elif isinstance(patch_path, Sequence):
+            args.patch_path = [str(item) for item in patch_path]
+        print(f"[generate_stage2_user_grid] using checkpoint patch_path={args.patch_path}")
+    bool_defaults = (
+        "user_projection_bias",
+        "user_projection_norm_affine",
+        "user_adapter_projection_bias",
+        "user_adapter_zero_init_out",
+        "train_user_adapter_out_proj",
+    )
+    for name in bool_defaults:
+        if getattr(args, name, None) is None and name in critical:
+            setattr(args, name, bool(critical[name]))
+            print(f"[generate_stage2_user_grid] using checkpoint {name}={getattr(args, name)}")
 
 
 def _make_run_dir(output_root: Path, run_name: Optional[str]) -> Path:
@@ -329,7 +350,8 @@ def _condition_scale_plan(args: argparse.Namespace) -> List[Tuple[str, Optional[
 def _collect_user_scale_stats(prior: Any) -> Dict[str, Any]:
     values: List[float] = []
     rows: List[Dict[str, Any]] = []
-    for name, param in prior.named_parameters():
+    named_tensors = list(prior.named_parameters()) + list(prior.named_buffers())
+    for name, param in named_tensors:
         if not (name == "user_scale" or name.endswith(".user_scale")):
             continue
         value = float(param.detach().float().cpu().item())
@@ -345,6 +367,35 @@ def _collect_user_scale_stats(prior: Any) -> Dict[str, Any]:
         "mean_abs": float(sum(abs(item) for item in values) / len(values)),
         "rows": rows,
     }
+
+
+def _tensor_pairwise_metrics(left: Tensor, right: Tensor) -> Dict[str, float]:
+    if tuple(left.shape) != tuple(right.shape):
+        raise ValueError(f"Tensor shape mismatch: {tuple(left.shape)} vs {tuple(right.shape)}")
+    left_f = left.detach().float().flatten().cpu()
+    right_f = right.detach().float().flatten().cpu()
+    delta = left_f - right_f
+    left_norm = float(torch.linalg.vector_norm(left_f).item())
+    right_norm = float(torch.linalg.vector_norm(right_f).item())
+    delta_norm = float(torch.linalg.vector_norm(delta).item())
+    cosine = float(torch.nn.functional.cosine_similarity(left_f.unsqueeze(0), right_f.unsqueeze(0), dim=1).item())
+    return {
+        "l2_norm": delta_norm,
+        "relative_l2_norm_left": delta_norm / (left_norm + 1e-12),
+        "relative_l2_norm_symmetric": delta_norm / (((left_norm + right_norm) * 0.5) + 1e-12),
+        "mean_abs_diff": float(delta.abs().mean().item()),
+        "max_abs_diff": float(delta.abs().max().item()),
+        "cosine_similarity": cosine,
+        "left_l2_norm": left_norm,
+        "right_l2_norm": right_norm,
+    }
+
+
+def _pairwise_metrics_from_tensors(tensors: Mapping[str, Tensor]) -> Dict[str, Dict[str, float]]:
+    metrics: Dict[str, Dict[str, float]] = {}
+    for left, right in itertools.combinations(tensors.keys(), 2):
+        metrics[f"{left}__vs__{right}"] = _tensor_pairwise_metrics(tensors[left], tensors[right])
+    return metrics
 
 
 def _run_prior_generation(
@@ -366,6 +417,7 @@ def _run_prior_generation(
         sample_id = f"sample_{sample_idx:04d}_{sample.get('user_embedding_id')}_{sample.get('query_pair_key')}"
         sample_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in sample_id)
         condition_records: Dict[str, Dict[str, Any]] = {}
+        embeddings_by_condition: Dict[str, Tensor] = {}
         for condition, scale, condition_key in condition_plan:
             if scale is not None:
                 args._active_inference_user_scale = float(scale)
@@ -388,6 +440,7 @@ def _run_prior_generation(
                 )
             tensor_path = embeddings_dir / f"{sample_id}_{condition_key}.pt"
             torch.save(embeddings.detach().cpu(), tensor_path)
+            embeddings_by_condition[str(condition_key)] = embeddings.detach().float().cpu()
             condition_records[str(condition_key)] = {
                 "condition": str(condition),
                 "inference_user_scale": None if scale is None else float(scale),
@@ -406,6 +459,7 @@ def _run_prior_generation(
                 "dispreferred_uid": sample.get("dispreferred_uid"),
                 "support_pairs": sample.get("support_pairs"),
                 "conditions": condition_records,
+                "prior_pairwise_metrics": _pairwise_metrics_from_tensors(embeddings_by_condition),
             }
         )
 
@@ -413,6 +467,131 @@ def _run_prior_generation(
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return records, compatibility
+
+
+def _pixel_pairwise_metrics(left_path: Path, right_path: Path, *, resize: int) -> Dict[str, float]:
+    from PIL import Image
+
+    left = Image.open(left_path).convert("RGB")
+    right = Image.open(right_path).convert("RGB")
+    if resize > 0:
+        left = left.resize((resize, resize), resample=Image.Resampling.BICUBIC)
+        right = right.resize((resize, resize), resample=Image.Resampling.BICUBIC)
+    elif left.size != right.size:
+        right = right.resize(left.size, resample=Image.Resampling.BICUBIC)
+    left_t = torch.from_numpy(np.asarray(left, dtype=np.float32)).flatten() / 255.0
+    right_t = torch.from_numpy(np.asarray(right, dtype=np.float32)).flatten() / 255.0
+    return _tensor_pairwise_metrics(left_t, right_t)
+
+
+def _load_clip_image_model(args: argparse.Namespace, device: torch.device) -> Tuple[Any, Any]:
+    from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+
+    cache_dir = None
+    if args.hf_home is not None:
+        cache_dir = str(args.hf_home.expanduser().resolve() / "hub")
+        print(f"[generate_stage2_user_grid] using CLIP cache_dir={cache_dir}")
+
+    processor = CLIPImageProcessor.from_pretrained(
+        args.clip_image_model_id,
+        local_files_only=bool(args.local_files_only),
+        cache_dir=cache_dir,
+    )
+    model = CLIPVisionModelWithProjection.from_pretrained(
+        args.clip_image_model_id,
+        local_files_only=bool(args.local_files_only),
+        cache_dir=cache_dir,
+    )
+    model.eval().to(device=device)
+    return processor, model
+
+
+def _encode_clip_images(
+    *,
+    image_paths: Sequence[Path],
+    processor: Any,
+    model: Any,
+    device: torch.device,
+) -> Dict[str, Tensor]:
+    from PIL import Image
+
+    images = [Image.open(path).convert("RGB") for path in image_paths]
+    inputs = processor(images=images, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(device=device)
+    try:
+        dtype = next(model.parameters()).dtype
+        pixel_values = pixel_values.to(dtype=dtype)
+    except StopIteration:
+        pass
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values, return_dict=True)
+    embeds = getattr(outputs, "image_embeds", None)
+    if embeds is None:
+        embeds = getattr(outputs, "pooler_output", None)
+    if embeds is None:
+        raise RuntimeError("Could not extract CLIP image embeddings.")
+    return {str(path): embed.detach().float().cpu() for path, embed in zip(image_paths, embeds)}
+
+
+def _add_image_pairwise_metrics(
+    *,
+    records: Sequence[Mapping[str, Any]],
+    run_dir: Path,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> List[Dict[str, Any]]:
+    updated_records = [dict(record) for record in records]
+    clip_processor = None
+    clip_model = None
+    clip_metric_error: Optional[str] = None
+    if bool(args.compute_clip_image_metrics):
+        try:
+            clip_processor, clip_model = _load_clip_image_model(args, device)
+        except Exception as exc:
+            clip_metric_error = str(exc)
+            print(
+                "[generate_stage2_user_grid] CLIP image metrics disabled: "
+                f"failed to load {args.clip_image_model_id}: {clip_metric_error}"
+            )
+
+    for record in updated_records:
+        condition_records = {str(key): dict(value) for key, value in dict(record["conditions"]).items()}
+        image_paths: Dict[str, Path] = {}
+        for condition, condition_record in condition_records.items():
+            raw_path = condition_record.get("decoded_image_path")
+            if raw_path:
+                image_paths[condition] = run_dir / str(raw_path)
+
+        pixel_metrics: Dict[str, Dict[str, float]] = {}
+        for left, right in itertools.combinations(image_paths.keys(), 2):
+            pixel_metrics[f"{left}__vs__{right}"] = _pixel_pairwise_metrics(
+                image_paths[left],
+                image_paths[right],
+                resize=int(args.pixel_metric_resize),
+            )
+        record["pixel_pairwise_metrics"] = pixel_metrics
+
+        if clip_processor is not None and clip_model is not None and image_paths:
+            clip_embeddings_by_path = _encode_clip_images(
+                image_paths=list(image_paths.values()),
+                processor=clip_processor,
+                model=clip_model,
+                device=device,
+            )
+            clip_embeddings = {
+                condition: clip_embeddings_by_path[str(path)]
+                for condition, path in image_paths.items()
+            }
+            record["clip_image_pairwise_metrics"] = _pairwise_metrics_from_tensors(clip_embeddings)
+        elif clip_metric_error is not None:
+            record["clip_image_metric_error"] = clip_metric_error
+        record["conditions"] = condition_records
+
+    if clip_model is not None:
+        del clip_model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return updated_records
 
 
 def _decode_generated_images(
@@ -482,6 +661,13 @@ def _decode_generated_images(
     del decoder_pipe
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    if bool(args.compute_image_metrics):
+        decoded_records = _add_image_pairwise_metrics(
+            records=decoded_records,
+            run_dir=run_dir,
+            args=args,
+            device=device,
+        )
     return decoded_records
 
 
@@ -493,21 +679,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--uid-to-path-json-path", type=Path, default=DEFAULT_UID_TO_PATH_JSON_PATH)
     parser.add_argument("--prior-model-id", type=str, default=DEFAULT_PRIOR_MODEL_ID)
     parser.add_argument("--decoder-model-id", type=str, default=DEFAULT_DECODER_MODEL_ID)
+    parser.add_argument(
+        "--hf-home",
+        type=Path,
+        default=DEFAULT_HF_HOME,
+        help=(
+            "HuggingFace cache root used only for CLIP image metrics. "
+            "Stable Cascade prior/decoder keep the process default cache."
+        ),
+    )
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--torch-dtype", type=str, default="bfloat16", choices=("auto", "float16", "bfloat16", "float32"))
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--patch-path", action="append", default=None)
     parser.add_argument(
+        "--patch-all-attention-blocks",
+        dest="patch_path",
+        action="append_const",
+        const="__all__",
+        help="Patch every detected Stable Cascade attention block.",
+    )
+    parser.add_argument(
         "--user-scale",
         type=float,
         default=None,
         help="Patch-time user_scale. Defaults to checkpoint critical_config.user_scale.",
     )
-    parser.add_argument("--user-projection-bias", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--user-projection-norm-affine", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--user-adapter-projection-bias", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--user-adapter-zero-init-out", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--user-projection-bias", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--user-projection-norm-affine", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--user-adapter-projection-bias", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--user-adapter-zero-init-out", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--train-user-adapter-out-proj", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--inference-user-scale", type=float, default=1.0)
     parser.add_argument(
         "--inference-user-scale-sweep",
@@ -533,6 +736,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition", action="append", choices=CONDITIONS, default=None)
     parser.add_argument("--decode-mode", choices=("decoder", "none"), default="decoder")
     parser.add_argument("--save-grid", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--compute-image-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute decoded-image pixel/CLIP pairwise metrics when decode-mode=decoder.",
+    )
+    parser.add_argument(
+        "--compute-clip-image-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute CLIP image embedding pairwise metrics for decoded images.",
+    )
+    parser.add_argument("--clip-image-model-id", type=str, default="openai/clip-vit-large-patch14")
+    parser.add_argument(
+        "--pixel-metric-resize",
+        type=int,
+        default=256,
+        help="Resize decoded images to this square size for pixel metrics; use 0 for original size.",
+    )
     parser.add_argument("--max-support-pairs", type=int, default=5)
     parser.add_argument("--grid-cell-size", type=int, default=256)
     parser.add_argument("--validate-assignment-support-pairs", action=argparse.BooleanOptionalAction, default=True)
@@ -547,6 +769,16 @@ def main() -> int:
     _apply_checkpoint_arg_defaults(args)
     if args.user_scale is None:
         args.user_scale = 1.0
+    if args.user_projection_bias is None:
+        args.user_projection_bias = True
+    if args.user_projection_norm_affine is None:
+        args.user_projection_norm_affine = True
+    if args.user_adapter_projection_bias is None:
+        args.user_adapter_projection_bias = True
+    if args.user_adapter_zero_init_out is None:
+        args.user_adapter_zero_init_out = False
+    if args.train_user_adapter_out_proj is None:
+        args.train_user_adapter_out_proj = True
     if args.condition is None:
         args.condition = ["real_user"]
     if int(args.num_users) < 1:
@@ -591,6 +823,10 @@ def main() -> int:
             "decoder_steps": int(args.decoder_steps),
             "decoder_guidance_scale": float(args.decoder_guidance_scale),
             "decode_mode": args.decode_mode,
+            "compute_image_metrics": bool(args.compute_image_metrics),
+            "compute_clip_image_metrics": bool(args.compute_clip_image_metrics),
+            "clip_image_model_id": args.clip_image_model_id,
+            "pixel_metric_resize": int(args.pixel_metric_resize),
             "conditions": list(args.condition),
             "inference_user_scale": float(args.inference_user_scale),
             "inference_user_scale_sweep": list(args.inference_user_scale_sweep or []),

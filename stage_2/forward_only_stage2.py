@@ -126,7 +126,10 @@ def _resolve_torch_dtype(dtype_arg: str) -> Optional[torch.dtype]:
     raise ValueError(f"Unsupported dtype: {dtype_arg}")
 
 
-def _parse_patch_paths(raw_paths: Optional[Sequence[str]]) -> List[str]:
+PATCH_ALL_SENTINEL = "__all__"
+
+
+def _parse_patch_paths(raw_paths: Optional[Sequence[str]]) -> Optional[List[str]]:
 
     if not raw_paths:
         return list(DEFAULT_PATCH_PATHS)
@@ -136,6 +139,10 @@ def _parse_patch_paths(raw_paths: Optional[Sequence[str]]) -> List[str]:
         for item in raw.split(","):
             item = item.strip()
             if item:
+                if item in {PATCH_ALL_SENTINEL, "all", "*"}:
+                    if len(raw_paths) > 1 or paths:
+                        raise ValueError("--patch-all-attention-blocks cannot be combined with --patch-path.")
+                    return None
                 paths.append(item)
     return paths
 
@@ -771,6 +778,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=None,
         help="Patch path; may be repeated or comma-separated. Defaults to a small safe patch set.",
+    )
+    parser.add_argument(
+        "--patch-all-attention-blocks",
+        dest="patch_path",
+        action="append_const",
+        const=PATCH_ALL_SENTINEL,
+        help="Patch every detected Stable Cascade attention block.",
     )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--device", type=str, default="auto")

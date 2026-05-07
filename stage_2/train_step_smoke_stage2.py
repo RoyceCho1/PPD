@@ -151,6 +151,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Patch path; may be repeated or comma-separated. Defaults to Stage 1 patch paths.",
     )
+    parser.add_argument(
+        "--patch-all-attention-blocks",
+        dest="patch_path",
+        action="append_const",
+        const="__all__",
+        help="Patch every detected Stable Cascade attention block.",
+    )
     parser.add_argument("--user-scale", type=float, default=1.0)
     parser.add_argument("--dpo-beta", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)

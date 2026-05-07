@@ -456,7 +456,15 @@ def patch_stage_c_with_user_adapter(
     )
 
 
-def freeze_stage_c_except_user_modules(model: nn.Module) -> None:
+def freeze_stage_c_except_user_modules(
+    model: nn.Module,
+    *,
+    train_user_projection: bool = True,
+    train_user_adapter_k_proj: bool = True,
+    train_user_adapter_v_proj: bool = True,
+    train_user_adapter_out_proj: bool = True,
+    train_user_scale: bool = True,
+) -> None:
     # Freeze the Stage C backbone and keep only the user-conditioning trainable
     # subset needed for preference smoke training.
     for param in model.parameters():
@@ -465,15 +473,19 @@ def freeze_stage_c_except_user_modules(model: nn.Module) -> None:
     for module in model.modules():
         if not isinstance(module, PatchedSDCascadeAttnBlock):
             continue
-        for param in module.user_projection.parameters(): # user projection parameter
-            param.requires_grad = True
-        for param in module.user_adapter.k_proj.parameters(): # user W_k
-            param.requires_grad = True
-        for param in module.user_adapter.v_proj.parameters(): # user W_v
-            param.requires_grad = True
-        for param in module.user_adapter.out_proj.parameters(): # user branch output projection
-            param.requires_grad = True
-        if isinstance(module.user_scale, nn.Parameter):
+        if train_user_projection:
+            for param in module.user_projection.parameters(): # user projection parameter
+                param.requires_grad = True
+        if train_user_adapter_k_proj:
+            for param in module.user_adapter.k_proj.parameters(): # user W_k
+                param.requires_grad = True
+        if train_user_adapter_v_proj:
+            for param in module.user_adapter.v_proj.parameters(): # user W_v
+                param.requires_grad = True
+        if train_user_adapter_out_proj:
+            for param in module.user_adapter.out_proj.parameters(): # user branch output projection
+                param.requires_grad = True
+        if train_user_scale and isinstance(module.user_scale, nn.Parameter):
             module.user_scale.requires_grad = True # user scale parameter
 
 
