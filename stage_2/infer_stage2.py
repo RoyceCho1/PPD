@@ -375,6 +375,15 @@ def _is_user_conditioning_param(name: str) -> bool:
     )
 
 
+def _is_user_branch_state_name(name: str) -> bool:
+    return (
+        ".user_projection." in name
+        or ".user_adapter." in name
+        or name.endswith(".user_scale")
+        or name == "user_scale"
+    )
+
+
 def _normalize_patch_paths_for_compare(raw: Any) -> List[str]:
     if raw is None:
         return list(_parse_patch_paths(None))
@@ -401,10 +410,36 @@ def _get_trainable_state(checkpoint: Mapping[str, Any]) -> Mapping[str, Tensor]:
     return state  # type: ignore[return-value]
 
 
+def _get_user_branch_state(checkpoint: Mapping[str, Any]) -> Mapping[str, Tensor]:
+    state = checkpoint.get("user_branch_state")
+    if state is None:
+        return _get_trainable_state(checkpoint)
+    if not isinstance(state, Mapping):
+        raise RuntimeError("Checkpoint `user_branch_state` must be a mapping.")
+    if not all(torch.is_tensor(value) for value in state.values()):
+        raise RuntimeError("All checkpoint user_branch_state values must be tensors.")
+    return state  # type: ignore[return-value]
+
+
+def _user_branch_state_names(prior: nn.Module) -> List[str]:
+    names = [
+        name
+        for name, _ in prior.named_parameters()
+        if _is_user_branch_state_name(name)
+    ]
+    names.extend(
+        name
+        for name, _ in prior.named_buffers()
+        if _is_user_branch_state_name(name)
+    )
+    return sorted(names)
+
+
 def _validate_checkpoint_metadata(
     checkpoint: Mapping[str, Any],
     args: argparse.Namespace,
     current_trainable_names: Sequence[str],
+    current_user_branch_names: Sequence[str],
 ) -> Dict[str, Any]:
     warnings: List[str] = []
     critical = checkpoint.get("critical_config")
@@ -442,11 +477,29 @@ def _validate_checkpoint_metadata(
     if latent_shape is None:
         warnings.append("checkpoint critical_config has no latent_shape.")
 
+    user_branch_state = _get_user_branch_state(checkpoint)
+    user_branch_state_names = set(user_branch_state.keys())
+    if "user_branch_state" not in checkpoint:
+        warnings.append(
+            "checkpoint has no user_branch_state; frozen user-branch parameters such as out_proj "
+            "will use the current initialization."
+        )
+    else:
+        expected_user_branch_names = set(current_user_branch_names)
+        missing_user_branch = sorted(expected_user_branch_names - user_branch_state_names)
+        extra_user_branch = sorted(user_branch_state_names - expected_user_branch_names)
+        if missing_user_branch or extra_user_branch:
+            raise RuntimeError(
+                "user_branch_state key mismatch: "
+                f"missing={missing_user_branch[:10]}, extra={extra_user_branch[:10]}"
+            )
+
     return {
         "checkpoint_critical_config": dict(critical),
         "trainable_state_tensors": len(state_names),
+        "user_branch_state_tensors": len(user_branch_state_names),
         "trainable_scope_mode": "+".join(found_markers),
-        "user_branch_structure_keys": sorted(state_names),
+        "user_branch_structure_keys": sorted(user_branch_state_names),
         "compatibility_warnings": warnings,
         "inference_config_version": INFERENCE_CONFIG_VERSION,
     }
@@ -454,9 +507,15 @@ def _validate_checkpoint_metadata(
 
 def _load_state_into_prior(prior: nn.Module, trainable_state: Mapping[str, Tensor]) -> None:
     params = dict(prior.named_parameters())
+    buffers = dict(prior.named_buffers())
     with torch.no_grad():
         for name, source in trainable_state.items():
-            target = params[name]
+            if name in params:
+                target = params[name]
+            elif name in buffers:
+                target = buffers[name]
+            else:
+                raise RuntimeError(f"Checkpoint state key not found in prior: {name}")
             target.copy_(source.to(device=target.device, dtype=target.dtype))
 
 
@@ -528,8 +587,13 @@ def _prepare_prior_pipeline(args: argparse.Namespace, device: torch.device) -> T
     )
     trainable_summary = summarize_trainable_parameters(prior, max_names=40)
     current_trainable_names = [name for name, param in prior.named_parameters() if param.requires_grad]
-    compatibility = _validate_checkpoint_metadata(checkpoint, args, current_trainable_names)
-    _load_state_into_prior(prior, _get_trainable_state(checkpoint))
+    compatibility = _validate_checkpoint_metadata(
+        checkpoint,
+        args,
+        current_trainable_names,
+        _user_branch_state_names(prior),
+    )
+    _load_state_into_prior(prior, _get_user_branch_state(checkpoint))
 
     prior.eval()
     text_encoder = getattr(pipe, "text_encoder", None)
@@ -764,22 +828,25 @@ def inference_user_conditioning_hooks(
         if not isinstance(output, Tensor):
             raise TypeError(f"Expected patched block tensor output, got {type(output)}")
 
-        query, restore = module._to_token_sequence(output)
-        module._sync_user_modules(reference=query)
-        local_user_emb = user_emb.to(device=query.device, dtype=query.dtype)
-        local_mask = user_emb_attention_mask.to(device=query.device) if user_emb_attention_mask is not None else None
+        if not _inputs or not isinstance(_inputs[0], Tensor):
+            raise TypeError("PatchedSDCascadeAttnBlock hook expected the original hidden-state tensor as input[0].")
+        projected_query = module.project_original_attention_query(_inputs[0])
+        _, restore = module._to_token_sequence(output)
+        module._sync_user_modules(reference=projected_query)
+        local_user_emb = user_emb.to(device=projected_query.device, dtype=projected_query.dtype)
+        local_mask = user_emb_attention_mask.to(device=projected_query.device) if user_emb_attention_mask is not None else None
         local_user_emb, local_mask = _expand_user_conditioning_for_query(
             local_user_emb,
             local_mask,
-            query_batch_size=int(query.shape[0]),
+            query_batch_size=int(projected_query.shape[0]),
         )
 
         user_tokens = module.user_projection(
             user_emb=local_user_emb,
             user_emb_attention_mask=local_mask,
         )
-        user_residual = module.user_adapter(
-            query=query,
+        user_residual = module.user_adapter.forward_with_projected_query(
+            projected_query=projected_query,
             user_tokens=user_tokens,
             user_attention_mask=local_mask,
         )

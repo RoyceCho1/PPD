@@ -405,8 +405,14 @@ def _run_prior_generation(
     run_dir: Path,
     device: torch.device,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    prior_pipe, compatibility = _prepare_prior_pipeline(args, device)
-    compatibility["checkpoint_user_scale_stats"] = _collect_user_scale_stats(prior_pipe.prior)
+    reuse_prior = bool(getattr(args, "reuse_prior_across_conditions", False))
+    prior_pipe = None
+    compatibility: Optional[Dict[str, Any]] = None
+    prior_reload_count = 0
+    if reuse_prior:
+        prior_pipe, compatibility = _prepare_prior_pipeline(args, device)
+        compatibility["checkpoint_user_scale_stats"] = _collect_user_scale_stats(prior_pipe.prior)
+        prior_reload_count = 1
     embeddings_dir = run_dir / "embeddings"
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     records: List[Dict[str, Any]] = []
@@ -419,12 +425,25 @@ def _run_prior_generation(
         condition_records: Dict[str, Dict[str, Any]] = {}
         embeddings_by_condition: Dict[str, Tensor] = {}
         for condition, scale, condition_key in condition_plan:
+            print(
+                "[generate_stage2_user_grid] "
+                f"prior sample={sample_idx + 1}/{len(samples)} "
+                f"condition={condition_key} "
+                f"fresh_reload={not reuse_prior}"
+            )
+            active_prior_pipe = prior_pipe
+            if active_prior_pipe is None:
+                active_prior_pipe, current_compatibility = _prepare_prior_pipeline(args, device)
+                current_compatibility["checkpoint_user_scale_stats"] = _collect_user_scale_stats(active_prior_pipe.prior)
+                prior_reload_count += 1
+                if compatibility is None:
+                    compatibility = current_compatibility
             if scale is not None:
                 args._active_inference_user_scale = float(scale)
             elif hasattr(args, "_active_inference_user_scale"):
                 delattr(args, "_active_inference_user_scale")
             embeddings, residual_summary = _run_prior_condition(
-                pipe=prior_pipe,
+                pipe=active_prior_pipe,
                 prompt=str(sample["caption"]),
                 condition=str(condition),
                 user_emb=user_emb,
@@ -433,6 +452,10 @@ def _run_prior_generation(
                 device=device,
                 seed=int(args.seed),
             )
+            if not reuse_prior:
+                del active_prior_pipe
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             has_nan, has_inf, all_finite = _finite_flags(embeddings)
             if not all_finite:
                 raise RuntimeError(
@@ -463,7 +486,13 @@ def _run_prior_generation(
             }
         )
 
-    del prior_pipe
+    if compatibility is None:
+        compatibility = {}
+    compatibility["fresh_prior_per_condition"] = not reuse_prior
+    compatibility["reuse_prior_across_conditions"] = reuse_prior
+    compatibility["prior_reload_count"] = prior_reload_count
+    if prior_pipe is not None:
+        del prior_pipe
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return records, compatibility
@@ -758,6 +787,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-support-pairs", type=int, default=5)
     parser.add_argument("--grid-cell-size", type=int, default=256)
     parser.add_argument("--validate-assignment-support-pairs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--reuse-prior-across-conditions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse one prior pipeline across all sample/condition generations. "
+            "Default is False, which reloads the prior per condition for condition-independent eval."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--run-name", type=str, default=None)
     return parser
@@ -830,6 +868,8 @@ def main() -> int:
             "conditions": list(args.condition),
             "inference_user_scale": float(args.inference_user_scale),
             "inference_user_scale_sweep": list(args.inference_user_scale_sweep or []),
+            "fresh_prior_per_condition": not bool(args.reuse_prior_across_conditions),
+            "reuse_prior_across_conditions": bool(args.reuse_prior_across_conditions),
             "seed": int(args.seed),
         },
         "inputs": {

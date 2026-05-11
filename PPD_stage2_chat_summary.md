@@ -621,3 +621,77 @@ CUDA_VISIBLE_DEVICES=0,1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python
 5. all-block full run 재시작
 6. checkpoint step별 scale sweep으로 norm/cosine/grid 비교
 ```
+
+## 17. Codex / VS Code Auto-Review 및 Reconnecting 장애 기록
+
+2026-05-08부터 Codex auto-review가 `auto-review timed out`으로 끝나고, 일반 채팅도 `thinking` 중 `reconnecting`이 여러 번 뜬 뒤 응답이 오는 증상이 있었다.
+
+확인한 사실:
+
+- repo 내부 hook/script 문제는 아니었다.
+- auto-review 세션은 원래 `codex-auto-review` guardian subagent로 `read-only` sandbox, `approval_policy=never`로 뜨는 것이 정상이다.
+- `~/.codex/models_cache.json`이 이전 client version `0.128.0` 기준으로 남아 있었고, VS Code 확장/CLI는 `0.129.0-alpha.15` 계열로 올라가면서 모델 캐시 miss가 발생했다.
+- 이때 로그에 `failed to refresh available models: timeout waiting for child process to exit`가 반복됐다.
+
+모델 캐시 쪽 조치:
+
+- 기존 `~/.codex/models_cache.json`은 `~/.codex/models_cache.json.bak`로 보존했다.
+- `.bak`의 구조를 유지한 채 `client_version`을 `0.129.0`으로 맞춘 새 `models_cache.json`을 만들었다.
+- VS Code reload 후 로그에서 `models cache: cache hit`, `models cache: cache entry applied models_count=6`, `using cached models for OnlineIfUncached`를 확인했다.
+- 따라서 auto-review 모델 캐시 문제는 해결된 것으로 판단했다.
+
+남은 reconnecting 원인:
+
+- 단순 질의(`today's date`)와 low intelligence에서도 매번 `reconnecting`이 반복되어 reasoning latency 문제가 아니라고 판단했다.
+- 최근 `remoteexthost.log`에서 OpenAI 확장 쪽 `Error: not-connected`가 연속으로 찍혔다.
+- stack은 `openai.chatgpt-26.506.21252-linux-x64/out/extension.js`의 `sendBroadcast`에서 발생했다.
+- 더 직접적인 원인은 OpenAI 확장이 내부 IPC socket을 열지 못하는 것이었다.
+
+핵심 에러:
+
+```text
+Error: listen EACCES: permission denied /tmp/codex-ipc/ipc-1007.sock
+Error: not-connected
+```
+
+권한 상태:
+
+```text
+current user: uid=1007(roycecho)
+/tmp/codex-ipc: owner=jaewoong group=jaewoong mode=775
+/tmp/codex-ipc/ipc-1001.sock: owner=jaewoong group=jaewoong
+```
+
+해석:
+
+- OpenAI VS Code 확장은 Linux에서 `os.tmpdir()/codex-ipc/ipc-<uid>.sock` 형태의 socket을 만든다.
+- 현재 `os.tmpdir()`이 `/tmp`이고, `/tmp/codex-ipc`가 다른 사용자 소유 `775`라서 `roycecho`가 `ipc-1007.sock`을 만들 수 없다.
+- 그래서 확장의 IPC router가 실패하고, webview broadcast channel이 `not-connected`가 되며, UI에서는 `reconnecting`으로 보인다.
+- `~/.codex` cache/memory 삭제만으로는 `/tmp/codex-ipc` 권한 문제가 해결되지 않는다.
+
+관리자 권한이 있을 때의 직접 해결:
+
+```bash
+sudo chmod 1777 /tmp/codex-ipc
+```
+
+또는:
+
+```bash
+sudo rm -rf /tmp/codex-ipc
+```
+
+관리자 권한 없이 시도할 수 있는 우회책:
+
+```text
+1. user-writable TMPDIR를 만들기
+2. VS Code Remote Server가 시작될 때 TMPDIR=/data/roycecho/.tmp 를 갖도록 설정
+3. VS Code Remote Server를 완전히 재시작
+4. OpenAI 확장이 /data/roycecho/.tmp/codex-ipc/ipc-1007.sock을 쓰는지 확인
+```
+
+주의:
+
+- `~/.codex/auth.json`, `~/.codex/config.toml`, `~/.codex/plugins`, `~/.codex/skills`, `~/.codex/sessions`는 삭제하면 로그인/설정/플러그인/세션 정보가 날아갈 수 있다.
+- 전체 삭제보다 먼저 `/tmp/codex-ipc` 권한 문제를 우회하는 것이 맞다.
+- 정리 삭제가 필요하면 `~/.codex/cache`, `~/.codex/models_cache.json`, `~/.codex/logs_*.sqlite*`, `~/.codex/state_*.sqlite*`, `~/.codex/.tmp`, `~/.codex/tmp`, `~/.codex/shell_snapshots` 정도만 백업 후 제한적으로 삭제하는 편이 안전하다.

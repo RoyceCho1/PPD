@@ -964,6 +964,27 @@ def _collect_trainable_state(model: nn.Module) -> Dict[str, Tensor]:
     }
 
 
+def _is_user_branch_state_name(name: str) -> bool:
+    return (
+        ".user_projection." in name
+        or ".user_adapter." in name
+        or name.endswith(".user_scale")
+        or name == "user_scale"
+    )
+
+
+def _collect_user_branch_state(model: nn.Module) -> Dict[str, Tensor]:
+    state = {
+        name: param.detach().cpu()
+        for name, param in model.named_parameters()
+        if _is_user_branch_state_name(name)
+    }
+    for name, buffer in model.named_buffers():
+        if _is_user_branch_state_name(name):
+            state[name] = buffer.detach().cpu()
+    return state
+
+
 def _load_trainable_state(model: nn.Module, state: Mapping[str, Tensor]) -> None:
     current = dict(_trainable_named_parameters(model))
     expected = {name for name in current if _is_user_conditioning_param(name)}
@@ -975,6 +996,31 @@ def _load_trainable_state(model: nn.Module, state: Mapping[str, Tensor]) -> None
     with torch.no_grad():
         for name in sorted(expected):
             current[name].copy_(state[name].to(device=current[name].device, dtype=current[name].dtype))
+
+
+def _load_user_branch_state(model: nn.Module, state: Mapping[str, Tensor]) -> None:
+    current: Dict[str, Tensor] = {
+        name: param
+        for name, param in model.named_parameters()
+        if _is_user_branch_state_name(name)
+    }
+    current.update(
+        {
+            name: buffer
+            for name, buffer in model.named_buffers()
+            if _is_user_branch_state_name(name)
+        }
+    )
+    incoming = set(state.keys())
+    expected = set(current.keys())
+    missing = sorted(expected - incoming)
+    extra = sorted(incoming - expected)
+    if missing or extra:
+        raise RuntimeError(f"User branch state key mismatch: missing={missing[:10]}, extra={extra[:10]}")
+    with torch.no_grad():
+        for name in sorted(expected):
+            target = current[name]
+            target.copy_(state[name].to(device=target.device, dtype=target.dtype))
 
 
 def _collect_user_scale_summary(model: nn.Module) -> Dict[str, Any]:
@@ -1107,8 +1153,13 @@ def _save_checkpoint(
     run_dir: Path,
     checkpoint_kind: str,
 ) -> str:
+    user_branch_state = _collect_user_branch_state(bundle.train_prior)
+    trainable_state = _collect_trainable_state(bundle.train_prior)
     payload = {
-        "trainable_state": _collect_trainable_state(bundle.train_prior),
+        "checkpoint_state_version": 2,
+        "trainable_state": trainable_state,
+        "user_branch_state": user_branch_state,
+        "user_branch_state_tensors": len(user_branch_state),
         "user_scale_summary": _collect_user_scale_summary(bundle.train_prior),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
@@ -1487,7 +1538,10 @@ def main() -> int:
         if args.resume_from is not None:
             checkpoint = _torch_load_checkpoint(args.resume_from.expanduser().resolve(), map_location="cpu")
             _check_resume_compatibility(checkpoint, args)
-            _load_trainable_state(bundle.train_prior, checkpoint["trainable_state"])
+            if "user_branch_state" in checkpoint:
+                _load_user_branch_state(bundle.train_prior, checkpoint["user_branch_state"])
+            else:
+                _load_trainable_state(bundle.train_prior, checkpoint["trainable_state"])
             optimizer.load_state_dict(checkpoint["optimizer_state"])
             _optimizer_to_device(optimizer, bundle.train_device)
             lr_scheduler.load_state_dict(checkpoint["scheduler_state"])
