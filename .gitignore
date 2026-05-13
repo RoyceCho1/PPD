@@ -10,6 +10,7 @@ artifacts
 stage2_latents
 *.pdf
 latents
+pca_data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

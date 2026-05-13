@@ -405,7 +405,8 @@ def _run_prior_generation(
     run_dir: Path,
     device: torch.device,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    reuse_prior = bool(getattr(args, "reuse_prior_across_conditions", False))
+    fresh_prior = bool(getattr(args, "fresh_prior_per_condition", False))
+    reuse_prior = not fresh_prior
     prior_pipe = None
     compatibility: Optional[Dict[str, Any]] = None
     prior_reload_count = 0
@@ -488,7 +489,7 @@ def _run_prior_generation(
 
     if compatibility is None:
         compatibility = {}
-    compatibility["fresh_prior_per_condition"] = not reuse_prior
+    compatibility["fresh_prior_per_condition"] = fresh_prior
     compatibility["reuse_prior_across_conditions"] = reuse_prior
     compatibility["prior_reload_count"] = prior_reload_count
     if prior_pipe is not None:
@@ -568,6 +569,7 @@ def _add_image_pairwise_metrics(
     run_dir: Path,
     args: argparse.Namespace,
     device: torch.device,
+    uid_to_path: Mapping[str, str],
 ) -> List[Dict[str, Any]]:
     updated_records = [dict(record) for record in records]
     clip_processor = None
@@ -601,8 +603,17 @@ def _add_image_pairwise_metrics(
         record["pixel_pairwise_metrics"] = pixel_metrics
 
         if clip_processor is not None and clip_model is not None and image_paths:
+            preferred_path = _image_path_for_uid(uid_to_path, record.get("preferred_uid"))
+            dispreferred_path = _image_path_for_uid(uid_to_path, record.get("dispreferred_uid"))
+            clip_image_paths = list(image_paths.values())
+            reference_paths: List[Path] = []
+            if preferred_path is not None and preferred_path.exists():
+                reference_paths.append(preferred_path)
+            if dispreferred_path is not None and dispreferred_path.exists():
+                reference_paths.append(dispreferred_path)
+
             clip_embeddings_by_path = _encode_clip_images(
-                image_paths=list(image_paths.values()),
+                image_paths=clip_image_paths + reference_paths,
                 processor=clip_processor,
                 model=clip_model,
                 device=device,
@@ -612,6 +623,56 @@ def _add_image_pairwise_metrics(
                 for condition, path in image_paths.items()
             }
             record["clip_image_pairwise_metrics"] = _pairwise_metrics_from_tensors(clip_embeddings)
+
+            if preferred_path is None or dispreferred_path is None:
+                record["clip_preference_metric_error"] = "missing preferred or dispreferred uid path"
+            elif not preferred_path.exists() or not dispreferred_path.exists():
+                record["clip_preference_metric_error"] = (
+                    "preferred or dispreferred image path does not exist: "
+                    f"preferred={preferred_path}, dispreferred={dispreferred_path}"
+                )
+            else:
+                preferred_embed = clip_embeddings_by_path[str(preferred_path)]
+                dispreferred_embed = clip_embeddings_by_path[str(dispreferred_path)]
+                margins: Dict[str, float] = {}
+                preference_metrics: Dict[str, Dict[str, Any]] = {}
+                for condition, generated_embed in clip_embeddings.items():
+                    sim_preferred = float(
+                        torch.nn.functional.cosine_similarity(
+                            generated_embed.unsqueeze(0),
+                            preferred_embed.unsqueeze(0),
+                            dim=1,
+                        ).item()
+                    )
+                    sim_dispreferred = float(
+                        torch.nn.functional.cosine_similarity(
+                            generated_embed.unsqueeze(0),
+                            dispreferred_embed.unsqueeze(0),
+                            dim=1,
+                        ).item()
+                    )
+                    margin = sim_preferred - sim_dispreferred
+                    margins[condition] = margin
+                    preference_metrics[condition] = {
+                        "preferred_uid": record.get("preferred_uid"),
+                        "dispreferred_uid": record.get("dispreferred_uid"),
+                        "preferred_image_path": str(preferred_path),
+                        "dispreferred_image_path": str(dispreferred_path),
+                        "sim_to_preferred": sim_preferred,
+                        "sim_to_dispreferred": sim_dispreferred,
+                        "preference_margin": margin,
+                        "preference_margin_gain_vs_base": None,
+                    }
+
+                base_margin = margins.get("base")
+                if base_margin is not None:
+                    for condition, metric in preference_metrics.items():
+                        metric["base_preference_margin"] = base_margin
+                        metric["preference_margin_gain_vs_base"] = margins[condition] - base_margin
+
+                record["clip_preference_metrics"] = preference_metrics
+                for condition, metric in preference_metrics.items():
+                    condition_records[condition]["clip_preference_metrics"] = metric
         elif clip_metric_error is not None:
             record["clip_image_metric_error"] = clip_metric_error
         record["conditions"] = condition_records
@@ -696,8 +757,54 @@ def _decode_generated_images(
             run_dir=run_dir,
             args=args,
             device=device,
+            uid_to_path=uid_to_path,
         )
     return decoded_records
+
+
+def _summarize_clip_preference_metrics(records: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    by_condition: Dict[str, List[Mapping[str, Any]]] = {}
+    for record in records:
+        metrics = record.get("clip_preference_metrics")
+        if not isinstance(metrics, Mapping):
+            continue
+        for condition, metric in metrics.items():
+            if isinstance(metric, Mapping):
+                by_condition.setdefault(str(condition), []).append(metric)
+
+    summary: Dict[str, Dict[str, Any]] = {}
+    for condition, rows in by_condition.items():
+        margins = [
+            float(row["preference_margin"])
+            for row in rows
+            if row.get("preference_margin") is not None
+        ]
+        gains = [
+            float(row["preference_margin_gain_vs_base"])
+            for row in rows
+            if row.get("preference_margin_gain_vs_base") is not None
+        ]
+        if not margins:
+            continue
+        condition_summary: Dict[str, Any] = {
+            "count": len(margins),
+            "mean_preference_margin": float(sum(margins) / len(margins)),
+            "min_preference_margin": float(min(margins)),
+            "max_preference_margin": float(max(margins)),
+        }
+        if gains:
+            condition_summary.update(
+                {
+                    "mean_preference_margin_gain_vs_base": float(sum(gains) / len(gains)),
+                    "min_preference_margin_gain_vs_base": float(min(gains)),
+                    "max_preference_margin_gain_vs_base": float(max(gains)),
+                    "fraction_preference_margin_gain_positive": float(
+                        sum(1 for gain in gains if gain > 0.0) / len(gains)
+                    ),
+                }
+            )
+        summary[condition] = condition_summary
+    return summary
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -788,12 +895,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-cell-size", type=int, default=256)
     parser.add_argument("--validate-assignment-support-pairs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--fresh-prior-per-condition",
+        action="store_true",
+        default=False,
+        help=(
+            "Reload the prior pipeline for every sample/condition generation. "
+            "This is slower but avoids condition-order effects during strict comparisons."
+        ),
+    )
+    parser.add_argument(
         "--reuse-prior-across-conditions",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=False,
         help=(
             "Reuse one prior pipeline across all sample/condition generations. "
-            "Default is False, which reloads the prior per condition for condition-independent eval."
+            "This is now the default; the flag is kept for command compatibility."
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -819,6 +935,8 @@ def main() -> int:
         args.train_user_adapter_out_proj = True
     if args.condition is None:
         args.condition = ["real_user"]
+    if bool(args.fresh_prior_per_condition) and bool(args.reuse_prior_across_conditions):
+        raise ValueError("--fresh-prior-per-condition and --reuse-prior-across-conditions cannot be used together")
     if int(args.num_users) < 1:
         raise ValueError("--num-users must be >= 1")
     if int(args.queries_per_user) < 1:
@@ -868,8 +986,8 @@ def main() -> int:
             "conditions": list(args.condition),
             "inference_user_scale": float(args.inference_user_scale),
             "inference_user_scale_sweep": list(args.inference_user_scale_sweep or []),
-            "fresh_prior_per_condition": not bool(args.reuse_prior_across_conditions),
-            "reuse_prior_across_conditions": bool(args.reuse_prior_across_conditions),
+            "fresh_prior_per_condition": bool(args.fresh_prior_per_condition),
+            "reuse_prior_across_conditions": not bool(args.fresh_prior_per_condition),
             "seed": int(args.seed),
         },
         "inputs": {
@@ -882,6 +1000,7 @@ def main() -> int:
         },
         "dataset_stats": dataset.get_stats(),
         "checkpoint_compatibility": compatibility,
+        "clip_preference_metric_summary": _summarize_clip_preference_metrics(decoded_records),
         "records": decoded_records,
     }
     _write_json(run_dir / "summary.json", summary)
