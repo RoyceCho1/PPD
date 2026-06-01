@@ -695,3 +695,508 @@ sudo rm -rf /tmp/codex-ipc
 - `~/.codex/auth.json`, `~/.codex/config.toml`, `~/.codex/plugins`, `~/.codex/skills`, `~/.codex/sessions`는 삭제하면 로그인/설정/플러그인/세션 정보가 날아갈 수 있다.
 - 전체 삭제보다 먼저 `/tmp/codex-ipc` 권한 문제를 우회하는 것이 맞다.
 - 정리 삭제가 필요하면 `~/.codex/cache`, `~/.codex/models_cache.json`, `~/.codex/logs_*.sqlite*`, `~/.codex/state_*.sqlite*`, `~/.codex/.tmp`, `~/.codex/tmp`, `~/.codex/shell_snapshots` 정도만 백업 후 제한적으로 삭제하는 편이 안전하다.
+
+## 18. 2026-05-13 Stage 2 최신 상태 업데이트
+
+### 18.1 2-GPU reference split 학습 지원
+
+`train_stage2_full.py` / smoke 계열에서 `reference_prior`를 train model과 다른 device에 둘 수 있도록 수정했다.
+
+핵심 의도:
+
+- DDP/torchrun이 아니라 OOM 완화 목적이다.
+- train forward/backward는 train device에서 수행한다.
+- frozen reference forward는 reference device에서 수행한다.
+- reference error tensor만 detach 후 train device로 가져와 DPO loss를 계산한다.
+
+현재 device 해석:
+
+```text
+--device cuda:0
+--reference-device cuda:1
+```
+
+또는:
+
+```text
+--reference-device cuda
+```
+
+`cuda` 단독은 기존 호환성을 위해 train device alias로 둔다.
+
+중요 로그 필드:
+
+```text
+train_device
+reference_device
+train_cuda_reserved_mb
+reference_cuda_reserved_mb
+```
+
+`CUDA_VISIBLE_DEVICES=0,1`에서 `--device cuda:0 --reference-device cuda:1`이면 GPU 0/1로 분리된다.
+
+### 18.2 checkpoint 저장/로드 bug fix
+
+09/11 계열에서 발견한 핵심 문제:
+
+- 기존 checkpoint는 `trainable_state`만 저장했다.
+- `--no-train-user-adapter-out-proj`일 때 `user_adapter.out_proj`는 frozen parameter라서 checkpoint에 저장되지 않았다.
+- eval에서 prior를 fresh reload하면 frozen `out_proj`가 매번 random init될 수 있었다.
+- 그 결과 같은 checkpoint, 같은 seed 조건에서도 `real_user`와 scale sweep의 `real_user_scale_1`이 서로 달라질 수 있었다.
+
+수정 후 checkpoint format:
+
+```text
+checkpoint_state_version = 2
+trainable_state
+user_branch_state
+user_branch_state_tensors
+```
+
+`user_branch_state`에는 user branch 관련 trainable/frozen parameter와 buffer를 모두 저장한다.
+
+포함 대상 예:
+
+```text
+user_projection.*
+user_adapter.q_proj.*
+user_adapter.out_proj.*
+user_adapter.query_norm.*
+user_adapter.user_norm.*
+user_scale
+```
+
+eval 쪽 `infer_stage2.py`도 `user_branch_state`가 있으면 그것을 우선 로드한다. legacy checkpoint에 `user_branch_state`가 없으면 compatibility warning을 남긴다.
+
+기존 checkpoint 상태 비교:
+
+```text
+09_4block_no_out_proj:
+  checkpoint_state_version: None
+  trainable_state: 32
+  user_branch_state: None
+
+11_full_no_out_proj:
+  checkpoint_state_version: None
+  trainable_state: 512
+  user_branch_state: None
+
+12_4block_no_out_proj_freeze:
+  checkpoint_state_version: 2
+  trainable_state: 32
+  user_branch_state: 68
+
+13_4block_everything:
+  checkpoint_state_version: 2
+  trainable_state: 40
+  user_branch_state: 68
+```
+
+따라서 09/11은 legacy checkpoint라 완전 복구 불가이고, 12/13 이후 checkpoint는 reload 안정성이 확보된 상태다.
+
+### 18.3 inference hook 정합성 수정
+
+eval hook이 training hook과 다르게 query를 쓰던 문제도 수정했다.
+
+현재 eval hook은 training과 동일하게:
+
+```text
+module.project_original_attention_query(_inputs[0])
+module.user_adapter.forward_with_projected_query(...)
+```
+
+경로를 사용한다.
+
+이 수정 후 eval 시 user branch 적용 방식이 train-time forward와 일치한다.
+
+### 18.4 `generate_stage2_user_grid.py` prior reload 기본값 변경
+
+초기에는 condition 간 상태 오염을 피하기 위해 condition마다 prior를 fresh reload하도록 바꿨다.
+
+하지만 속도/일반 eval 편의 때문에 현재 기본값은 다시 prior 재사용이다.
+
+현재 기본:
+
+```text
+fresh_prior_per_condition: False
+reuse_prior_across_conditions: True
+```
+
+strict comparison이 필요할 때만 아래 flag를 추가한다.
+
+```bash
+--fresh-prior-per-condition
+```
+
+기존 compatibility flag:
+
+```bash
+--reuse-prior-across-conditions
+```
+
+는 남아 있지만, 현재 기본 동작과 같아서 일반적으로 넣을 필요가 없다.
+
+두 flag를 동시에 넣으면 에러를 내도록 했다.
+
+### 18.5 CLIP preference margin metric 추가
+
+qualitative grid만으로 personalization을 판단하기 부족해서 generated image가 query preferred/dispreferred 중 어느 쪽에 더 가까운지 CLIP image metric을 추가했다.
+
+각 generated image condition별 계산:
+
+```text
+preference_margin =
+  sim(CLIP_image(generated), CLIP_image(preferred))
+  -
+  sim(CLIP_image(generated), CLIP_image(dispreferred))
+```
+
+base 대비 gain:
+
+```text
+preference_margin_gain_vs_base =
+  preference_margin(condition)
+  -
+  preference_margin(base)
+```
+
+해석:
+
+```text
+gain > 0:
+  user conditioning이 preferred 쪽으로 이동
+
+gain ~= 0:
+  이미지 품질은 좋아도 personalization은 약함
+
+gain < 0:
+  오히려 dispreferred 쪽으로 이동
+```
+
+기록 위치:
+
+```text
+records[*].clip_preference_metrics
+records[*].conditions[condition].clip_preference_metrics
+summary.clip_preference_metric_summary
+```
+
+`summary.clip_preference_metric_summary`에는 condition별 평균 margin/gain과 positive gain fraction을 저장한다.
+
+주의:
+
+- `preference_margin_gain_vs_base`를 보려면 eval command에 `--condition base`가 포함되어야 한다.
+- `decode-mode=decoder`, `compute_image_metrics=True`, `compute_clip_image_metrics=True`일 때 계산된다.
+- 기본값은 image/CLIP metric 모두 True다.
+
+### 18.6 12/13 재학습 완료 및 확인
+
+완료된 새 checkpoint:
+
+```text
+/data/roycecho/PPD/artifacts/stage2_train_full/12_4block_no_out_proj_freeze/checkpoint_best.pt
+/data/roycecho/PPD/artifacts/stage2_train_full/13_4block_everything/checkpoint_best.pt
+```
+
+12번 `best_val32` summary 확인 결과:
+
+```text
+fresh_prior_per_condition: True
+reuse_prior_across_conditions: False
+prior_reload_count: 12
+user_branch_state_tensors: 68
+compatibility_warnings: []
+```
+
+즉 12번 eval은 수정된 checkpoint 로딩과 fresh reload 경로를 정상적으로 탔다.
+
+13번과 scale sweep 쪽은 필요 시 같은 방식으로 `summary.json`의 `checkpoint_compatibility`, `runtime`, `clip_preference_metric_summary`를 확인하면 된다.
+
+### 18.7 09/11 분석 요약
+
+기존 관찰:
+
+- 09 `4block no out_proj`가 11 `full no out_proj`보다 qualitative 결과가 더 좋았다.
+- 11은 validation DPO loss가 더 좋아도 generation에서는 과도한 user conditioning / drift가 컸다.
+- all-block patch는 val loss만 보고 고르기 어렵고, generation scale sweep과 CLIP preference margin까지 같이 봐야 한다.
+
+이전 metric 비교 예:
+
+```text
+09 scale 1.0:
+  prior relative L2 ~= 1.0839
+  prior cosine ~= 0.4307
+  pixel relative L2 ~= 0.8897
+  CLIP image cosine ~= 0.8088
+
+11 scale 1.0:
+  prior relative L2 ~= 2.3465
+  prior cosine ~= 0.1287
+  pixel relative L2 ~= 1.1441
+  CLIP image cosine ~= 0.5223
+```
+
+해석:
+
+- 09는 user branch가 base에서 어느 정도 이동하지만 이미지 identity/구조가 덜 무너졌다.
+- 11은 너무 많은 block을 건드려 generation drift가 커진 것으로 보인다.
+- 이후 all-block 계열은 scale 0.1~0.3도 같이 봐야 한다.
+
+### 18.8 legacy 09 seed variation eval command
+
+legacy 09 checkpoint를 고정하고, validation shard32의 같은 4 samples에서 seed만 3개 바꾸는 eval을 준비했다.
+
+현재 sample selection은 seed에 의존하지 않는다. 따라서 아래 조건이면 seed를 바꿔도 같은 4 samples가 선택된다.
+
+```text
+validation_shard32
+num_users=4
+queries_per_user=1
+```
+
+실험 command:
+
+```bash
+for SEED in 0 42 123; do
+  CUDA_VISIBLE_DEVICES=0 python stage_2/tasks/eval/generate_stage2_user_grid.py \
+    --checkpoint-path /data/roycecho/PPD/artifacts/stage2_train_full/09_4block_no_out_proj/checkpoint_best.pt \
+    --embedding-json-path data/user_emb_7b_full/validation_shard32.json \
+    --assignment-jsonl-path artifacts/pair_assignments/validation/stage2_pair_assignments_validation_shard32.jsonl \
+    --uid-to-path-json-path data/validation_uid_to_path.json \
+    --torch-dtype bfloat16 \
+    --device cuda \
+    --local-files-only \
+    --num-users 4 \
+    --queries-per-user 1 \
+    --condition base \
+    --condition zero_user \
+    --condition real_user \
+    --inference-user-scale 1.0 \
+    --fresh-prior-per-condition \
+    --height 1024 \
+    --width 1024 \
+    --prior-steps 20 \
+    --prior-guidance-scale 4.0 \
+    --decoder-steps 20 \
+    --seed "${SEED}" \
+    --output-dir /data/roycecho/PPD/artifacts/stage2_generation_grids/09_4block_no_out_proj \
+    --run-name "legacy09_val32_scale1_fresh_seed${SEED}"
+done
+```
+
+주의:
+
+- 09는 legacy checkpoint라 `user_branch_state`가 없다.
+- 이 실험은 09 checkpoint를 있는 그대로 보는 실험이며, 새 checkpoint fix가 반영된 조건은 아니다.
+
+### 18.9 all-block 2-GPU run command
+
+full attention block no out_proj를 checkpoint fix 이후 다시 학습하는 command를 준비했다.
+
+핵심 설정:
+
+```text
+--patch-all-attention-blocks
+--no-train-user-adapter-out-proj
+--user-scale 1.0
+--no-trainable-user-scale
+--device cuda:0
+--reference-device cuda:1
+--batch-size 2
+--gradient-accumulation-steps 98
+```
+
+권장 output dir:
+
+```text
+artifacts/stage2_train_full/14_allblock_2gpu_noOutProj
+```
+
+이 run은 11 `full_no_out_proj`의 재실험 성격이다.
+
+### 18.10 현재 진행 중인 Run 15
+
+2026-05-13 현재 Run 15 학습을 진행 중이다.
+
+목적:
+
+```text
+4block zero-init train out_proj
+```
+
+핵심 설정:
+
+```text
+patch_path:
+  down_blocks.0.2
+  down_blocks.0.5
+  down_blocks.0.8
+  down_blocks.0.11
+
+train_user_adapter_out_proj = true
+user_adapter_zero_init_out = true
+user_scale = 1.0
+trainable_user_scale = false
+```
+
+대표 command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python stage_2/train_stage2_full.py \
+  --train-embedding-json-paths "data/user_emb_7b_full/train_shard*.json" \
+  --train-assignment-jsonl-paths "artifacts/pair_assignments/train/stage2_pair_assignments_train_shard*.jsonl" \
+  --train-latent-manifest-jsonl-path /Data_Storage/roycecho/PPD/latents/latents_24x24_stability_raw/latent_manifest_train.jsonl \
+  --train-uid-to-path-json-path data/train_uid_to_path.json \
+  --val-embedding-json-paths "data/user_emb_7b_full/validation_shard*.json" \
+  --val-assignment-jsonl-paths "artifacts/pair_assignments/validation/stage2_pair_assignments_validation_shard*.jsonl" \
+  --val-latent-manifest-jsonl-path /Data_Storage/roycecho/PPD/latents/latents_24x24_stability_raw/latent_manifest_validation.jsonl \
+  --val-uid-to-path-json-path data/validation_uid_to_path.json \
+  --device cuda \
+  --reference-device cuda \
+  --torch-dtype bfloat16 \
+  --local-files-only \
+  --patch-path down_blocks.0.2 \
+  --patch-path down_blocks.0.5 \
+  --patch-path down_blocks.0.8 \
+  --patch-path down_blocks.0.11 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 98 \
+  --learning-rate 1e-5 \
+  --num-epochs 1 \
+  --user-scale 1.0 \
+  --no-trainable-user-scale \
+  --user-projection-bias \
+  --user-projection-norm-affine \
+  --user-adapter-projection-bias \
+  --user-adapter-zero-init-out \
+  --train-user-adapter-out-proj \
+  --user-dropout-prob 0.1 \
+  --log-every 1 \
+  --val-every-steps 100 \
+  --max-val-batches 20 \
+  --latest-checkpoint-every-steps 100 \
+  --checkpoint-every-steps 100 \
+  --keep-last-checkpoints 9999 \
+  --output-dir artifacts/stage2_train_full/15_4block_zeroInit_trainOutProj \
+  --wandb-mode online \
+  --wandb-run-name 4block_zeroInit_trainOutProj_us1fixed
+```
+
+Run 15의 실험 가설:
+
+- 기존 4block no out_proj는 결과가 좋았지만 out_proj가 frozen이었다.
+- out_proj를 train하되 zero init으로 시작하면 초기에는 기존 prior를 덜 깨고, 학습 후 user residual 출력 방향을 더 잘 맞출 수 있을 가능성이 있다.
+- zero init + train out_proj는 초반 gradient 흐름과 convergence를 따로 확인해야 한다.
+
+### 18.11 다음 후보 Run 16
+
+Run 16 후보:
+
+```text
+3block no early zero-init train out_proj
+```
+
+핵심 설정:
+
+```text
+patch_path:
+  down_blocks.0.5
+  down_blocks.0.8
+  down_blocks.0.11
+
+train_user_adapter_out_proj = true
+user_adapter_zero_init_out = true
+user_scale = 1.0
+trainable_user_scale = false
+```
+
+대표 command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python stage_2/train_stage2_full.py \
+  --train-embedding-json-paths "data/user_emb_7b_full/train_shard*.json" \
+  --train-assignment-jsonl-paths "artifacts/pair_assignments/train/stage2_pair_assignments_train_shard*.jsonl" \
+  --train-latent-manifest-jsonl-path /Data_Storage/roycecho/PPD/latents/latents_24x24_stability_raw/latent_manifest_train.jsonl \
+  --train-uid-to-path-json-path data/train_uid_to_path.json \
+  --val-embedding-json-paths "data/user_emb_7b_full/validation_shard*.json" \
+  --val-assignment-jsonl-paths "artifacts/pair_assignments/validation/stage2_pair_assignments_validation_shard*.jsonl" \
+  --val-latent-manifest-jsonl-path /Data_Storage/roycecho/PPD/latents/latents_24x24_stability_raw/latent_manifest_validation.jsonl \
+  --val-uid-to-path-json-path data/validation_uid_to_path.json \
+  --device cuda \
+  --reference-device cuda \
+  --torch-dtype bfloat16 \
+  --local-files-only \
+  --patch-path down_blocks.0.5 \
+  --patch-path down_blocks.0.8 \
+  --patch-path down_blocks.0.11 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 98 \
+  --learning-rate 1e-5 \
+  --num-epochs 1 \
+  --user-scale 1.0 \
+  --no-trainable-user-scale \
+  --user-projection-bias \
+  --user-projection-norm-affine \
+  --user-adapter-projection-bias \
+  --user-adapter-zero-init-out \
+  --train-user-adapter-out-proj \
+  --user-dropout-prob 0.1 \
+  --log-every 1 \
+  --val-every-steps 100 \
+  --max-val-batches 20 \
+  --latest-checkpoint-every-steps 100 \
+  --checkpoint-every-steps 100 \
+  --keep-last-checkpoints 9999 \
+  --output-dir artifacts/stage2_train_full/16_3block_noEarly_zeroInit_trainOutProj \
+  --wandb-mode online \
+  --wandb-run-name 3block_noEarly_zeroInit_trainOutProj_us1fixed
+```
+
+Run 16의 실험 가설:
+
+- early block `down_blocks.0.2`를 제외하면 low-level/layout drift를 줄일 수 있다.
+- 4block 대비 personalization strength는 약해질 수 있지만, visual stability는 좋아질 가능성이 있다.
+- Run 15와 비교할 때는 val DPO loss뿐 아니라 scale sweep grid, CLIP preference margin gain, image drift를 같이 봐야 한다.
+
+### 18.12 다음 평가 체크리스트
+
+새 run checkpoint가 나오면 최소 다음 eval을 수행한다.
+
+공통 조건:
+
+```text
+validation_shard32
+num_users=4
+queries_per_user=1
+base / zero_user / real_user
+scale sweep: 0.0 0.01 0.1 0.3 0.5 0.7 1.0
+height/width: 1024
+prior_steps: 20
+decoder_steps: 20
+seed: 0
+```
+
+확인할 summary 필드:
+
+```text
+checkpoint_compatibility.user_branch_state_tensors
+checkpoint_compatibility.compatibility_warnings
+runtime.fresh_prior_per_condition
+runtime.reuse_prior_across_conditions
+clip_preference_metric_summary
+records[*].clip_preference_metrics
+records[*].prior_pairwise_metrics
+records[*].clip_image_pairwise_metrics
+```
+
+판단 기준:
+
+```text
+1. grid가 visually stable한가
+2. real_user 또는 scale sweep에서 preferred 방향으로 이동하는가
+3. preference_margin_gain_vs_base가 양수인가
+4. scale이 커질수록 drift만 증가하는지, personalization이 증가하는지
+5. 09/12 baseline보다 좋은 scale 구간이 있는가
+```

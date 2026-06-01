@@ -263,6 +263,8 @@ def _save_visual_grid(
     sample: Mapping[str, Any],
     uid_to_path: Mapping[str, str],
     generated: Mapping[str, Path],
+    prompt: str,
+    negative_prompt: Optional[str],
     support_pairs_limit: int,
     cell_size: int,
 ) -> None:
@@ -303,8 +305,13 @@ def _save_visual_grid(
 
     num_cols = max(len(row) for row in rows)
     label_height = 34
-    caption_lines = _wrap_text(str(sample.get("caption", "")), width=max(42, num_cols * 34))
-    caption_height = 24 + 18 * min(len(caption_lines), 4)
+    prompt_lines = _wrap_text(f"generated prompt: {prompt}", width=max(42, num_cols * 34))
+    negative_prompt_lines: List[str] = []
+    if negative_prompt:
+        negative_prompt_lines = _wrap_text(f"negative prompt: {negative_prompt}", width=max(42, num_cols * 34))
+    visible_prompt_lines = prompt_lines[:4]
+    visible_negative_prompt_lines = negative_prompt_lines[:2]
+    caption_height = 26 + 18 * (len(visible_prompt_lines) + len(visible_negative_prompt_lines))
     grid_width = num_cols * cell_size
     row_height = cell_size + label_height
     grid_height = caption_height + len(rows) * row_height
@@ -312,8 +319,13 @@ def _save_visual_grid(
     draw = ImageDraw.Draw(grid)
     header = f"user={sample.get('user_embedding_id')} query={sample.get('query_pair_key')}"
     draw.text((8, 6), header[:120], fill=(0, 0, 0))
-    for line_idx, line in enumerate(caption_lines[:4]):
-        draw.text((8, 26 + line_idx * 18), line, fill=(40, 40, 40))
+    text_y = 26
+    for line in visible_prompt_lines:
+        draw.text((8, text_y), line, fill=(40, 40, 40))
+        text_y += 18
+    for line in visible_negative_prompt_lines:
+        draw.text((8, text_y), line, fill=(80, 80, 80))
+        text_y += 18
 
     y = caption_height
     for row in rows:
@@ -330,6 +342,57 @@ def _sample_user_tensors(sample: Mapping[str, Any], device: torch.device) -> Tup
     user_emb = torch.as_tensor(sample["user_emb"], dtype=torch.float32).unsqueeze(0).to(device)
     mask = torch.ones((1, int(user_emb.shape[1])), dtype=torch.long, device=device)
     return user_emb, mask
+
+
+def _random_user_tensor_like(user_emb: Tensor, *, seed: int) -> Tensor:
+    generator = torch.Generator(device=user_emb.device)
+    generator.manual_seed(int(seed))
+    random_emb = torch.randn(
+        tuple(user_emb.shape),
+        generator=generator,
+        device=user_emb.device,
+        dtype=user_emb.dtype,
+    )
+    source = user_emb.detach().float()
+    source_std = source.std(unbiased=False).clamp_min(1e-6).to(device=user_emb.device, dtype=user_emb.dtype)
+    source_mean = source.mean().to(device=user_emb.device, dtype=user_emb.dtype)
+    return random_emb * source_std + source_mean
+
+
+def _condition_user_tensors(
+    *,
+    condition: str,
+    sample_idx: int,
+    samples: Sequence[Mapping[str, Any]],
+    real_user_emb: Tensor,
+    real_user_mask: Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
+    metadata: Dict[str, Any] = {"user_source": "current"}
+    if condition == "shuffled_user":
+        if len(samples) < 2:
+            raise ValueError("shuffled_user condition requires at least two selected samples.")
+        shuffled_idx = (sample_idx + 1) % len(samples)
+        shuffled_sample = samples[shuffled_idx]
+        shuffled_emb, shuffled_mask = _sample_user_tensors(shuffled_sample, device)
+        metadata = {
+            "user_source": "shuffled",
+            "source_sample_index": shuffled_idx,
+            "source_user_embedding_id": shuffled_sample.get("user_embedding_id"),
+            "source_user_id": shuffled_sample.get("user_id"),
+        }
+        return shuffled_emb, shuffled_mask, metadata
+    if condition == "random_user":
+        random_seed = int(args.seed) + 1_000_003 + sample_idx
+        metadata = {
+            "user_source": "random_gaussian_matched_mean_std",
+            "random_seed": random_seed,
+            "source_user_embedding_mean": float(real_user_emb.detach().float().mean().cpu().item()),
+            "source_user_embedding_std": float(real_user_emb.detach().float().std(unbiased=False).cpu().item()),
+        }
+        return _random_user_tensor_like(real_user_emb, seed=random_seed), real_user_mask, metadata
+    return real_user_emb, real_user_mask, metadata
 
 
 def _condition_scale_plan(args: argparse.Namespace) -> List[Tuple[str, Optional[float], str]]:
@@ -443,12 +506,21 @@ def _run_prior_generation(
                 args._active_inference_user_scale = float(scale)
             elif hasattr(args, "_active_inference_user_scale"):
                 delattr(args, "_active_inference_user_scale")
+            condition_user_emb, condition_user_mask, user_condition_metadata = _condition_user_tensors(
+                condition=str(condition),
+                sample_idx=sample_idx,
+                samples=samples,
+                real_user_emb=user_emb,
+                real_user_mask=user_mask,
+                args=args,
+                device=device,
+            )
             embeddings, residual_summary = _run_prior_condition(
                 pipe=active_prior_pipe,
                 prompt=str(sample["caption"]),
                 condition=str(condition),
-                user_emb=user_emb,
-                user_mask=user_mask,
+                user_emb=condition_user_emb,
+                user_mask=condition_user_mask,
                 args=args,
                 device=device,
                 seed=int(args.seed),
@@ -471,6 +543,7 @@ def _run_prior_generation(
                 "embedding_path": str(tensor_path.relative_to(run_dir)),
                 "embedding_diagnostics": _tensor_diagnostics(embeddings),
                 "residual_summary": residual_summary,
+                "user_condition_metadata": user_condition_metadata,
             }
         records.append(
             {
@@ -727,6 +800,8 @@ def _decode_generated_images(
             image_path = images_dir / f"{sample_id}_{condition}.png"
             image.save(image_path)
             condition_record["decoded_image_path"] = str(image_path.relative_to(run_dir))
+            condition_record["generated_prompt"] = str(record["caption"])
+            condition_record["negative_prompt"] = args.negative_prompt
             generated_paths[condition] = image_path
             condition_records[condition] = condition_record
 
@@ -738,6 +813,8 @@ def _decode_generated_images(
                 sample=sample,
                 uid_to_path=uid_to_path,
                 generated=generated_paths,
+                prompt=str(record["caption"]),
+                negative_prompt=args.negative_prompt,
                 support_pairs_limit=int(args.max_support_pairs),
                 cell_size=int(args.grid_cell_size),
             )

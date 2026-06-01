@@ -62,7 +62,15 @@ DEFAULT_DECODER_MODEL_ID = "stabilityai/stable-cascade"
 DEFAULT_DECODE_LATENT_PROMPT = "a high quality image"
 EXPECTED_USER_EMB_DIM = 3584
 SUPPORTED_STANDALONE_LATENT_SHAPES = ((16, 12, 12), (16, 24, 24))
-CONDITIONS = ("base", "branch_off", "zero_user", "zero_user_zero_mask", "real_user")
+CONDITIONS = (
+    "base",
+    "branch_off",
+    "zero_user",
+    "zero_user_zero_mask",
+    "real_user",
+    "shuffled_user",
+    "random_user",
+)
 USER_CONDITIONING_NAME_MARKERS = (
     ".user_projection.",
     ".user_adapter.k_proj.",
@@ -902,7 +910,7 @@ def _run_prior_condition(
     elif condition == "zero_user_zero_mask":
         hook_user_emb = torch.zeros_like(user_emb)
         hook_user_mask = torch.zeros_like(user_mask)
-    elif condition == "real_user":
+    elif condition in ("real_user", "shuffled_user", "random_user"):
         hook_user_emb = user_emb
         hook_user_mask = user_mask
     else:

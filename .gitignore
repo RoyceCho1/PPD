@@ -11,7 +11,7 @@ stage2_latents
 *.pdf
 latents
 pca_data
-
+.sisyphus
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
